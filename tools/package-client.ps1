@@ -33,7 +33,7 @@ $sdlLicense = Join-Path $sdl.DirectoryName 'LICENSE.txt'
 if (Test-Path $sdlLicense) { Copy-Item $sdlLicense (Join-Path $out 'SDL3-LICENSE.txt') }
 @"
 Client stream CloudPC (pengganti Moonlight), lisensi GPL-3.0 (LICENSE-cloudpc-stream.txt).
-Source code: wajib disediakan untuk penerima program ini (lihat stream-rs/README.md bagian Lisensi).
+Source code (GPL-3.0): https://github.com/HusniHeartnet/cloudpc-stream-rs
 Komponen: FFmpeg (LGPL-2.1, FFMPEG-LICENSE.txt), SDL3 (zlib, SDL3-LICENSE.txt).
 "@ | Set-Content (Join-Path $out 'README.txt') -Encoding utf8
 Get-ChildItem $out | Select-Object Name, @{n = 'MB'; e = { '{0:N1}' -f ($_.Length / 1MB) } } | Format-Table -AutoSize | Out-String
