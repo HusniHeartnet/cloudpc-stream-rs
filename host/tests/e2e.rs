@@ -181,7 +181,7 @@ fn serverinfo_over_http_reports_unpaired_and_ports() {
 fn correct_pin_pairs_and_unlocks_https() {
     let rig = rig(Duration::from_secs(5));
     let before = https_get(&rig, &rig.client, &format!("/serverinfo?{UID}"));
-    assert_eq!(before.0, 401, "sebelum pairing HTTPS harus ditolak: {}", before.1);
+    assert_eq!((before.0, status_code(&before.1).as_str()), (200, "401"), "sebelum pairing HTTPS ditolak lewat XML seperti Sunshine: {}", before.1);
 
     write_pin(rig.state.path(), "4821", "cloudpc-uji").unwrap();
     let outcome = pair_as_moonlight(&rig, "4821");
@@ -197,8 +197,9 @@ fn correct_pin_pairs_and_unlocks_https() {
     let (_, xml) = https_get(&rig, &rig.client, &format!("/launch?{UID}&appid=1"));
     assert_eq!(status_code(&xml), "400", "launch tanpa kunci sesi");
 
-    // Lewat HTTP polos, endpoint khusus HTTPS tidak ada.
-    assert_eq!(http_get(&rig, &format!("/applist?{UID}")).0, 404);
+    // Lewat HTTP polos, endpoint khusus HTTPS tidak ada: seperti Sunshine, HTTP 200 dengan status_code 404 di XML.
+    let (http, xml) = http_get(&rig, &format!("/applist?{UID}"));
+    assert_eq!((http, status_code(&xml).as_str()), (200, "404"));
 }
 
 #[test]
@@ -209,7 +210,7 @@ fn wrong_pin_is_detected_by_both_sides_and_nothing_is_stored() {
     assert!(!outcome.host_proved_pin, "klien harus melihat host tidak memakai PIN yang sama");
     assert!(!outcome.paired, "host tidak boleh menerima klien dengan PIN salah");
     assert!(rig.host.paired_names().is_empty());
-    assert_eq!(https_get(&rig, &rig.client, &format!("/serverinfo?{UID}")).0, 401);
+    assert_eq!(status_code(&https_get(&rig, &rig.client, &format!("/serverinfo?{UID}")).1), "401");
 
     // PIN sudah terpakai: percobaan berikutnya dengan PIN benar pun harus menunggu PIN baru.
     let (_, xml) = http_get(&rig, &format!("/pair?{UID}&clientchallenge=00"));
@@ -249,7 +250,53 @@ fn out_of_order_and_malformed_requests_are_rejected() {
     assert_eq!(status_code(&xml), "400", "sesi sudah tidak ada");
     assert!(rig.host.paired_names().is_empty());
 
-    assert_eq!(http_get(&rig, "/tidak-ada").0, 404);
+    // Alamat tak dikenal (Moonlight memanggil `/unpair` saat pairing gagal, `/appasset` untuk gambar): HTTP 200 + XML 404
+    // seperti Sunshine. Status HTTP 404 membuat Moonlight melempar galat jaringan.
+    let (http, xml) = http_get(&rig, "/unpair?uniqueid=0123456789ABCDEF");
+    assert_eq!((http, status_code(&xml).as_str()), (200, "404"));
+    let (http, xml) = https_get(&rig, &rig.client, "/appasset?appid=1&AssetType=2&AssetIdx=0");
+    assert_eq!((http, status_code(&xml).as_str()), (200, "401"), "perangkat belum terpairing");
+
+    // Langkah tanpa parameter yang dikenal: 400 + paired=0 seperti `fail_pair` Sunshine, dan sesinya dibuang.
+    write_pin(rig.state.path(), "1234", "x").unwrap();
+    let (_, xml) = http_get(&rig, &format!("/pair?{UID}&phrase=getservercert&salt={}&clientcert={cert_hex}", hex_encode(&[1u8; 16])));
+    assert_eq!(tag(&xml, "paired").as_deref(), Some("1"));
+    let (http, xml) = http_get(&rig, &format!("/pair?{UID}&entah=1"));
+    assert_eq!((http, status_code(&xml).as_str(), tag(&xml, "paired").as_deref()), (200, "400", Some("0")));
+    let (_, xml) = http_get(&rig, &format!("/pair?{UID}&clientchallenge={}", hex_encode(&[0u8; 16])));
+    assert_eq!(status_code(&xml), "400", "sesi sudah dibuang");
+}
+
+/// Semua Moonlight memakai uniqueid yang sama. Pairing yang putus setelah PIN terpakai (mis. jaringan putus) tidak boleh
+/// menahan uniqueid itu: percobaan ulang langsung bisa pairing, bukan ditolak 409 selama beberapa menit.
+#[test]
+fn retry_after_pairing_abandoned_midway_is_not_blocked() {
+    let rig = rig(Duration::from_secs(5));
+    let cert_hex = hex_encode(rig.client.cert_pem.as_bytes());
+    write_pin(rig.state.path(), "1111", "cloudpc-putus").unwrap();
+    let (_, xml) = http_get(&rig, &format!("/pair?{UID}&phrase=getservercert&salt={}&clientcert={cert_hex}", hex_encode(&[3u8; 16])));
+    assert_eq!(tag(&xml, "paired").as_deref(), Some("1"));
+    // ... client hilang di sini. Percobaan baru dengan PIN baru:
+    write_pin(rig.state.path(), "4821", "cloudpc-uji").unwrap();
+    let outcome = pair_as_moonlight(&rig, "4821");
+    assert!(outcome.host_proved_pin && outcome.paired);
+    assert_eq!(rig.host.paired_names(), vec!["cloudpc-uji".to_string()]);
+}
+
+/// Pairing yang masih menunggu PIN tetap menolak percobaan kedua (seperti Sunshine), supaya PIN tidak direbut.
+#[test]
+fn second_pairing_while_first_waits_for_pin_is_refused() {
+    let rig = std::sync::Arc::new(rig(Duration::from_secs(2)));
+    let cert_hex = hex_encode(rig.client.cert_pem.as_bytes());
+    let first = {
+        let (rig, cert_hex) = (rig.clone(), cert_hex.clone());
+        std::thread::spawn(move || http_get(&rig, &format!("/pair?{UID}&phrase=getservercert&salt={}&clientcert={cert_hex}", hex_encode(&[3u8; 16]))))
+    };
+    std::thread::sleep(Duration::from_millis(300));
+    let (_, xml) = http_get(&rig, &format!("/pair?{UID}&phrase=getservercert&salt={}&clientcert={cert_hex}", hex_encode(&[4u8; 16])));
+    assert_eq!((status_code(&xml).as_str(), tag(&xml, "paired").as_deref()), ("409", Some("0")));
+    let (_, xml) = first.join().unwrap();
+    assert_eq!(status_code(&xml), "408", "tanpa PIN, percobaan pertama kedaluwarsa");
 }
 
 #[test]
@@ -261,7 +308,7 @@ fn stranger_certificate_stays_locked_out_after_someone_else_pairs() {
     let other_dir = tempfile::tempdir().unwrap();
     let stranger = Identity::load_or_create(other_dir.path()).unwrap();
     let (status, xml) = https_get(&rig, &stranger, &format!("/applist?{UID}"));
-    assert_eq!((status, status_code(&xml).as_str()), (401, "401"));
+    assert_eq!((status, status_code(&xml).as_str()), (200, "401"));
     assert_eq!(tag(&xml, "AppTitle"), None);
 }
 
@@ -632,7 +679,8 @@ fn unpairing_from_another_process_locks_the_device_out_and_ends_its_session() {
     });
     assert!(terminated && disconnected, "sesi perangkat yang dicabut harus diakhiri");
     assert!(rig.host.stream_snapshot().is_none() && rig.host.paired_names().is_empty());
-    assert_eq!(https_get(&rig, &rig.client, &format!("/serverinfo?{UID}")).0, 401, "sertifikat yang dicabut tidak diterima lagi");
+    let revoked = https_get(&rig, &rig.client, &format!("/serverinfo?{UID}"));
+    assert_eq!((revoked.0, status_code(&revoked.1).as_str()), (200, "401"), "sertifikat yang dicabut ditolak lewat XML (HTTP 200), supaya Moonlight jatuh ke \"belum terpairing\"");
     let (_, xml) = http_get(&rig, &format!("/serverinfo?{UID}"));
     assert_eq!(tag(&xml, "currentgame").as_deref(), Some("0"));
 }

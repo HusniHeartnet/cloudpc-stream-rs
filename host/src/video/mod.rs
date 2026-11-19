@@ -253,6 +253,8 @@ fn stream(host: &Host, socket: &UdpSocket, target: &Target) -> Result<(), String
         });
         // Encoder baru selalu mulai dari IDR.
         let mut force_idr = true;
+        // Waktu tangkapan hilang yang sedang dipulihkan, untuk mencatat lamanya gambar berhenti.
+        let mut recovering: Option<Instant> = lost_since;
         let mut next_tick = Instant::now();
 
         loop {
@@ -279,7 +281,16 @@ fn stream(host: &Host, socket: &UdpSocket, target: &Target) -> Result<(), String
             let wait_ms = if capture.has_image { 0 } else { 100 };
             match capture.update(wait_ms) {
                 Ok(()) => {}
-                Err(CaptureError::Lost) => break,
+                Err(CaptureError::Lost) => {
+                    // Jalur cepat: buka ulang duplikasi saja (device + encoder tetap, frame rujukan tetap sah, tanpa IDR).
+                    let since = *lost_since.get_or_insert_with(Instant::now);
+                    recovering = Some(since);
+                    if reopen_quickly(host, target.launch_id, &mut capture) {
+                        *host.desktop_size.lock().unwrap() = capture.source;
+                        continue;
+                    }
+                    break;
+                }
                 Err(CaptureError::Other(why)) => return Err(why),
             }
             if !capture.has_image {
@@ -304,6 +315,9 @@ fn stream(host: &Host, socket: &UdpSocket, target: &Target) -> Result<(), String
             let encoded = encoder.encode(force_idr, u64::from(index))?;
             force_idr = false;
             lost_since = None;
+            if let Some(since) = recovering.take() {
+                host.log(|| format!("video: gambar jalan lagi {} ms setelah tangkapan hilang (layar {}x{})", since.elapsed().as_millis(), capture.source.0, capture.source.1));
+            }
             idr_frames += u32::from(encoded.idr);
             let frame_type = match (encoded.idr, encoded.after_invalidation) {
                 (true, _) => FrameType::Idr,
@@ -336,10 +350,41 @@ fn stream(host: &Host, socket: &UdpSocket, target: &Target) -> Result<(), String
     }
 }
 
+#[cfg(windows)]
+/// Coba buka ulang duplikasi layar dengan jeda pendek selama +-2 detik (pergantian mode tampilan biasanya selesai dalam
+/// ratusan milidetik, dan duplikasi bisa hilang lagi sekali-dua kali di tengahnya). `false` = pakai pembuatan ulang penuh.
+fn reopen_quickly(host: &Host, launch_id: u32, capture: &mut capture::Capture) -> bool {
+    let started = Instant::now();
+    for wait_ms in REOPEN_BACKOFF_MS {
+        thread::sleep(Duration::from_millis(wait_ms));
+        if client_of(host, launch_id).is_err() {
+            return false;
+        }
+        if capture.reopen().is_ok() {
+            host.log(|| format!("video: tangkapan layar hilang, dibuka ulang dalam {} ms (layar {}x{})", started.elapsed().as_millis(), capture.source.0, capture.source.1));
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(windows)]
+/// Jeda antar percobaan `reopen_quickly` (total +-2 detik).
+const REOPEN_BACKOFF_MS: [u64; 9] = [0, 20, 50, 100, 150, 250, 350, 450, 600];
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use cloudpc_stream_proto::rtp::write_ping;
+
+    #[cfg(windows)]
+    #[test]
+    fn quick_reopen_tries_immediately_and_gives_up_within_about_two_seconds() {
+        assert_eq!(REOPEN_BACKOFF_MS[0], 0, "percobaan pertama tanpa jeda");
+        let total: u64 = REOPEN_BACKOFF_MS.iter().sum();
+        assert!((1500..=2500).contains(&total), "total {total} ms");
+        assert!(REOPEN_BACKOFF_MS.windows(2).all(|w| w[0] <= w[1]));
+    }
 
     #[test]
     fn only_pings_with_the_session_payload_are_accepted() {

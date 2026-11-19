@@ -119,7 +119,10 @@ struct Cursor {
 pub struct Capture {
     pub device: ID3D11Device,
     context: ID3D11DeviceContext,
-    duplication: IDXGIOutputDuplication,
+    /// Layar yang diduplikasi; disimpan supaya duplikasi bisa dibuka ulang tanpa membuat device dan encoder baru.
+    output: IDXGIOutput1,
+    /// `None` hanya sesaat di `reopen` (duplikasi lama wajib dilepas sebelum yang baru dibuat).
+    duplication: Option<IDXGIOutputDuplication>,
     desktop: ID3D11Texture2D,
     desktop_view: ID3D11ShaderResourceView,
     /// Gambar tersusun (desktop + kursor) beresolusi client, BGRA.
@@ -211,7 +214,45 @@ unsafe fn shader_view(device: &ID3D11Device, texture: &ID3D11Texture2D) -> Resul
     view.ok_or_else(|| "CreateShaderResourceView tanpa hasil".to_string())
 }
 
+unsafe fn duplicate(output: &IDXGIOutput1, device: &ID3D11Device) -> Result<(IDXGIOutputDuplication, (u32, u32)), String> {
+    let duplication = output.DuplicateOutput(device).map_err(|e| describe("DuplicateOutput (layar terkunci atau sudah diduplikasi terlalu banyak?)", e))?;
+    let mode = duplication.GetDesc().ModeDesc;
+    if mode.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
+        return Err(format!("format layar {:?} belum didukung (HDR menyala?)", mode.Format));
+    }
+    Ok((duplication, (mode.Width, mode.Height)))
+}
+
+unsafe fn desktop_texture(device: &ID3D11Device, source: (u32, u32)) -> Result<(ID3D11Texture2D, ID3D11ShaderResourceView), String> {
+    let desktop = texture(device, source.0, source.1, D3D11_BIND_SHADER_RESOURCE.0 as u32, None)?;
+    let view = shader_view(device, &desktop)?;
+    Ok((desktop, view))
+}
+
 impl Capture {
+    /// Buka ulang duplikasi layar setelah `CaptureError::Lost` (game ganti mode tampilan, desktop berganti), dengan device,
+    /// tekstur akhir, dan encoder yang SAMA: ukuran video ke client tidak berubah, jadi hanya tekstur sumber yang mengikuti
+    /// ukuran layar baru. Jauh lebih cepat daripada membuat semuanya ulang (temuan sesi #93: gambar berhenti 1-5 dtk tiap
+    /// RE2 berganti 1920x1080 <-> 1920x1440). Gagal = pemanggil jatuh ke pembuatan ulang penuh.
+    pub fn reopen(&mut self) -> Result<(), String> {
+        crate::supervise::sync_thread_desktop();
+        // SAFETY: lihat `new`.
+        unsafe {
+            // Aturan DXGI: setelah ACCESS_LOST, lepas duplikasi lama dulu, baru buat yang baru.
+            self.duplication = None;
+            let (duplication, source) = duplicate(&self.output, &self.device)?;
+            if source != self.source {
+                let (desktop, view) = desktop_texture(&self.device, source)?;
+                self.desktop = desktop;
+                self.desktop_view = view;
+                self.source = source;
+            }
+            self.duplication = Some(duplication);
+        }
+        self.has_image = false;
+        Ok(())
+    }
+
     /// Buka layar pertama di GPU NVIDIA; gambar akhir berukuran `target` (resolusi yang diminta client).
     pub fn new(target: (u32, u32)) -> Result<Capture, String> {
         // Duplikasi terikat ke desktop thread ini; layar kunci dan UAC adalah desktop lain.
@@ -220,15 +261,8 @@ impl Capture {
         let output = output.ok_or("tidak ada layar yang tersambung ke GPU NVIDIA")?;
         // SAFETY: panggilan COM/D3D11 biasa; semua hasil diperiksa lewat `Result`.
         unsafe {
-            let duplication = output.DuplicateOutput(&device).map_err(|e| describe("DuplicateOutput (layar terkunci atau sudah diduplikasi terlalu banyak?)", e))?;
-            let mode = duplication.GetDesc().ModeDesc;
-            if mode.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
-                return Err(format!("format layar {:?} belum didukung (HDR menyala?)", mode.Format));
-            }
-            let source = (mode.Width, mode.Height);
-
-            let desktop = texture(&device, source.0, source.1, D3D11_BIND_SHADER_RESOURCE.0 as u32, None)?;
-            let desktop_view = shader_view(&device, &desktop)?;
+            let (duplication, source) = duplicate(&output, &device)?;
+            let (desktop, desktop_view) = desktop_texture(&device, source)?;
             let frame = texture(&device, target.0, target.1, (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32, None)?;
             let mut frame_view = None;
             device.CreateRenderTargetView(&frame, None, Some(&mut frame_view)).map_err(|e| describe("CreateRenderTargetView", e))?;
@@ -262,7 +296,8 @@ impl Capture {
                 blend_invert: blend_state(&device, D3D11_BLEND_INV_DEST_COLOR, D3D11_BLEND_INV_SRC_COLOR)?,
                 device,
                 context,
-                duplication,
+                output,
+                duplication: Some(duplication),
                 desktop,
                 desktop_view,
                 _frame: frame,
@@ -292,7 +327,8 @@ impl Capture {
         unsafe {
             let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
             let mut resource: Option<IDXGIResource> = None;
-            match self.duplication.AcquireNextFrame(timeout_ms, &mut info, &mut resource) {
+            let Some(duplication) = self.duplication.clone() else { return Err(CaptureError::Lost) };
+            match duplication.AcquireNextFrame(timeout_ms, &mut info, &mut resource) {
                 Ok(()) => {}
                 Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(()),
                 Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => return Err(CaptureError::Lost),
@@ -312,7 +348,7 @@ impl Capture {
             if info.PointerShapeBufferSize > 0 {
                 self.read_cursor_shape(info.PointerShapeBufferSize);
             }
-            match self.duplication.ReleaseFrame() {
+            match duplication.ReleaseFrame() {
                 Ok(()) => Ok(()),
                 Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => Err(CaptureError::Lost),
                 Err(e) => Err(CaptureError::Other(describe("ReleaseFrame", e))),
@@ -325,7 +361,8 @@ impl Capture {
         let mut data = vec![0u8; size as usize];
         let mut required = 0u32;
         let mut shape = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
-        if self.duplication.GetFramePointerShape(size, data.as_mut_ptr() as *mut c_void, &mut required, &mut shape).is_err() {
+        let Some(duplication) = self.duplication.as_ref() else { return };
+        if duplication.GetFramePointerShape(size, data.as_mut_ptr() as *mut c_void, &mut required, &mut shape).is_err() {
             return;
         }
         let Some(image) = cursor::convert(shape.Type, shape.Width, shape.Height, shape.Pitch, &data) else { return };

@@ -288,6 +288,10 @@ pub fn run_with(
     // Timer 0,5 ms, prioritas tinggi, Wi-Fi tanpa pemindaian latar selama stream (moonlight-common-c melakukan yang sama).
     #[cfg(windows)]
     let _mode = cloudpc_stream_common::streaming_mode::StreamingMode::enter(cloudpc_stream_common::streaming_mode::Options { host: false });
+    // macOS: tanpa App Nap selama stream, supaya jendela yang tertutup jendela lain (chat TikTok LIVE) tetap lancar dan
+    // tetap bisa diambil Window Capture.
+    #[cfg(target_os = "macos")]
+    let _activity = crate::macos_activity::Activity::begin("CloudPC streaming");
     progress(format!("Kanal kontrol tersambung setelah {} ms", connected_after.as_millis()));
 
     let mut report = StreamReport { resumed: launched.resumed, codec: Some(params.codec), encryption: negotiated.encryption, packet_size, connected_after, ..Default::default() };

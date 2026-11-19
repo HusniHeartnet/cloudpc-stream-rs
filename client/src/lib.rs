@@ -5,6 +5,7 @@
 pub mod control;
 pub mod http;
 pub mod nvhttp;
+pub mod persist;
 pub mod rtsp;
 pub mod session;
 pub mod store;
@@ -19,3 +20,5 @@ pub mod frontend_sdl;
 pub mod gamepad;
 pub mod sdl;
 pub mod input;
+#[cfg(target_os = "macos")]
+pub mod macos_activity;

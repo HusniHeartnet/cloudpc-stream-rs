@@ -110,7 +110,7 @@ fn https_get(addr: &HostAddr, info: &ServerInfo, cert_der: &[u8], store: &Store,
     let sep = if query.is_empty() { "" } else { "&" };
     let target = format!("{path}?{}{sep}{query}", base_query(store));
     let (code, xml) = http::get(&addr.host, info.https_port, &target, Some(Tls { identity: &store.identity, host_cert_der: cert_der }), timeout)?;
-    if code == 401 {
+    if code == 401 || http::status(&xml).0 == 401 {
         return Err("host tidak lagi mengenali perangkat ini (pairing dicabut)".into());
     }
     Ok(xml)

@@ -123,6 +123,14 @@ fn random16() -> [u8; 16] {
     b
 }
 
+/// Alamat lokal seperti `net::addr_to_normalized_string` Sunshine: IPv6 yang memetakan IPv4 ditulis sebagai IPv4.
+fn normalized_ip(ip: std::net::IpAddr) -> String {
+    match ip {
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(|v4| v4.to_string()).unwrap_or_else(|| v6.to_string()),
+        v4 => v4.to_string(),
+    }
+}
+
 fn pair_failed(status: u16, message: &str) -> Xml {
     Xml::error(status, message).field("paired", 0)
 }
@@ -232,7 +240,7 @@ impl Host {
         let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
         let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
         let Ok(request) = read_request(&mut stream) else { return };
-        let local_ip = stream.local_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+        let local_ip = stream.local_addr().map(|a| normalized_ip(a.ip())).unwrap_or_default();
         let (status, xml) = self.route(&request, Origin::Http, &local_ip);
         let _ = write_response(&mut stream, status, &xml.render());
     }
@@ -240,7 +248,7 @@ impl Host {
     fn serve_https(&self, stream: TcpStream, tls: Arc<ServerConfig>) {
         let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
         let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-        let local_ip = stream.local_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+        let local_ip = stream.local_addr().map(|a| normalized_ip(a.ip())).unwrap_or_default();
         let Ok(conn) = ServerConnection::new(tls) else { return };
         let mut stream = StreamOwned::new(conn, stream);
         // Jabat tangan TLS terjadi di dalam pembacaan pertama; gagal (mis. tanpa sertifikat klien) = koneksi ditutup.
@@ -259,7 +267,10 @@ impl Host {
         let client = match origin {
             Origin::Http => None,
             Origin::Https(Some(name)) => Some(name),
-            Origin::Https(None) => return (401, Xml::error(401, "The client is not authorized. Certificate verification failed.")),
+            // Seperti Sunshine (`on_verify_failed`): HTTP 200 dengan `status_code="401"` di XML. Moonlight hanya jatuh
+            // ke HTTP polos ("belum terpairing") bila 401 ada di XML; status HTTP 401 dianggap galat jaringan, jadi
+            // perangkat yang pairing-nya sudah dicabut gagal "Failed to connect" di sesi berikutnya.
+            Origin::Https(None) => return (200, Xml::error(401, "The client is not authorized. Certificate verification failed.")),
         };
         let xml = match (request.path.as_str(), client) {
             ("/serverinfo", client) => self.serverinfo(request, client.is_some(), local_ip),
@@ -268,7 +279,9 @@ impl Host {
             ("/launch", Some(client)) => self.launch(request, client, false, local_ip),
             ("/resume", Some(client)) => self.launch(request, client, true, local_ip),
             ("/cancel", Some(client)) => self.cancel(client),
-            _ => return (404, Xml::error(404, "Not Found")),
+            // Seperti Sunshine (`not_found`): HTTP 200 dengan `status_code="404"` di XML. Moonlight memanggil `/unpair` saat
+            // pairing gagal dan `/appasset` untuk gambar aplikasi; status HTTP selain 200 membuatnya melempar galat jaringan.
+            _ => Xml::error(404, "Not Found"),
         };
         (200, xml)
     }
@@ -364,7 +377,9 @@ impl Host {
             .field("ExternalPort", self.ports.http)
             .field("MaxLumaPixelsHEVC", "1869449984")
             .field("mac", "00:00:00:00:00:00")
-            .field("LocalIP", local_ip)
+            // Seperti Sunshine: Moonlight menganggap LocalIP selalu IPv4; alamat IPv6 di sini menimpa alamat LAN IPv4 yang
+            // tersimpan, jadi lewat IPv6 dikirim 127.0.0.1 (Moonlight tahu mengabaikannya).
+            .field("LocalIP", if local_ip.contains(':') { "127.0.0.1" } else { local_ip })
             .field("ServerCodecModeSupport", codecs)
             .field("PairStatus", pair_status)
             .field("currentgame", running)
@@ -389,7 +404,8 @@ impl Host {
         } else if let Some(value) = request.arg("clientpairingsecret") {
             self.client_pairing_secret(session, value)
         } else {
-            return Xml::error(404, "Invalid pairing request");
+            // Seperti Sunshine (`fail_pair`): 400 + paired=0, dan sesi pairing dibuang.
+            Err("Invalid pairing request")
         };
         match step {
             Ok(Step::Continue(xml)) => xml,
@@ -417,8 +433,17 @@ impl Host {
         {
             let mut sessions = self.pairing.lock().unwrap();
             sessions.retain(|_, s| s.created.elapsed() < session_ttl);
-            if sessions.contains_key(uniqueid) {
-                return pair_failed(409, "A pairing session with this uniqueid already exists");
+            // Semua Moonlight memakai uniqueid yang sama (0123456789ABCDEF). Pairing yang putus di tengah jabat tangan (mis.
+            // jaringan putus setelah PIN dipakai) dulu menahan uniqueid itu sampai kedaluwarsa, jadi percobaan ulang ditolak
+            // 409 selama ±3 menit. Sesi yang PIN-nya sudah terpakai tidak bisa dilanjutkan siapa pun, jadi diganti saja;
+            // hanya sesi yang masih menunggu PIN (percobaan yang sedang berjalan) yang menolak dengan 409 seperti Sunshine.
+            match sessions.get(uniqueid) {
+                Some(old) if old.phase == Phase::WaitingPin => return pair_failed(409, "A pairing session with this uniqueid already exists"),
+                Some(_) => {
+                    self.log(|| "pairing lama yang terputus di tengah jalan diganti percobaan baru".into());
+                    sessions.remove(uniqueid);
+                }
+                None => {}
             }
             sessions.insert(
                 uniqueid.to_string(),

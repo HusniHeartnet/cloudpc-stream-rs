@@ -308,6 +308,9 @@ pub fn run<R: Send + 'static>(options: SdlOptions, session: impl FnOnce(SdlSink,
     let s = sdl::load()?;
     unsafe {
         (s.set_hint)(c"SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS".as_ptr(), c"1".as_ptr());
+        // Layar penuh tidak mengecil sendiri saat pemain pindah ke aplikasi lain (mis. membaca chat TikTok LIVE): jendela yang
+        // di-minimize tidak bisa diambil Window Capture.
+        (s.set_hint)(c"SDL_VIDEO_MINIMIZE_ON_FOCUS_LOSS".as_ptr(), c"0".as_ptr());
         if !(s.init)(sdl::INIT_VIDEO | sdl::INIT_AUDIO) {
             return Err(format!("SDL gagal dimulai: {}", s.error()));
         }

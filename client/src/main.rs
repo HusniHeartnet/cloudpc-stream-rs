@@ -17,7 +17,7 @@ const USAGE: &str = "Perintah:
   cloudpc-stream-client stream <host[:port]> <aplikasi> [--resolution 1920x1080] [--fps 60] [--bitrate 20000]
                         [--video-codec auto|H.264|HEVC|AV1] [--video-decoder auto|hardware|software]
                         [--display-mode windowed|borderless|fullscreen] [--frontend sdl]
-                        [--seconds N] [--dump-video <file>] [--headless]
+                        [--seconds N] [--dump-video <file>] [--headless] [--persist]
   cloudpc-stream-client quit <host[:port]>
   cloudpc-stream-client decode-test <berkas .h264|.hevc|.obu> <H.264|HEVC|AV1> [--video-decoder software]
   cloudpc-stream-client self-test [--seconds 5]      (jendela + suara tanpa host)
@@ -27,10 +27,13 @@ Opsi Moonlight lain yang tidak dikenal diterima dan diabaikan.
 `stream` menampilkan gambar di jendela (decode hardware D3D11VA lewat FFmpeg); --headless = tanpa jendela.
 Suara diputar di perangkat bawaan (--no-audio = tanpa suara). Input: keyboard, mouse (--absolute-mouse | bawaan relatif),
 gamepad XInput (--no-input = hanya menonton); --vsync, --quit-after, --audio-on-host, --game-optimization seperti Moonlight; --capture-system-keys never|fullscreen|always. Ctrl+Alt+Shift + Q keluar, X layar penuh, Z lepas input,
-M mode mouse, D kecilkan, V tempel teks, K tangkap tombol sistem, S statistik (--performance-overlay = tampil sejak awal). Log bergaya Moonlight (blok Global video stats).";
+M mode mouse, D kecilkan, V tempel teks, K tangkap tombol sistem, S statistik (--performance-overlay = tampil sejak awal). Log bergaya Moonlight (blok Global video stats).
+--persist: jendela tetap sama saat koneksi putus (sambung ulang otomatis) dan saat ganti kualitas (baris stdin
+`quality --bitrate N --fps N --resolution WxH --video-codec C`), supaya Window Capture (TikTok LIVE, OBS) tidak hilang.";
 
 /// Opsi Moonlight yang berdiri sendiri (tanpa nilai).
-const FLAGS: [&str; 16] = [
+const FLAGS: [&str; 17] = [
+    "--persist",
     "--performance-overlay",
     "--no-input",
     "--no-audio",
@@ -90,6 +93,14 @@ impl Args {
             None => default,
             Some(text) => text.parse().unwrap_or_else(|_| fail(&format!("{name} butuh angka, bukan \"{text}\""))),
         }
+    }
+
+    /// Argumen ini ditimpa `words` (perintah `quality` dari stdin): opsi yang sama memakai nilai terbaru.
+    fn with_overrides(&self, words: &[String]) -> Args {
+        let extra = Args::parse(words.to_vec());
+        let mut options = self.options.clone();
+        options.extend(extra.options);
+        Args { positional: self.positional.clone(), options }
     }
 
     fn host(&self) -> HostAddr {
@@ -163,21 +174,10 @@ fn main() {
         }
         Some("stream") => {
             let addr = args.host();
-            let app = args.positional.get(2).cloned().unwrap_or_else(|| fail(USAGE));
-            let (width, height) = match args.get("--resolution") {
-                None => (1920, 1080),
-                Some(text) => text.split_once('x').and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?))).unwrap_or_else(|| fail(&format!("--resolution tidak valid: {text}"))),
-            };
-            let options = StreamOptions {
-                app,
-                width,
-                height,
-                fps: args.number("--fps", 60),
-                bitrate_kbps: args.number("--bitrate", 20_000),
-                codec: parse_codec(args.get("--video-codec")),
-                dump_video: args.get("--dump-video").map(std::path::PathBuf::from),
-                launch: nvhttp::LaunchExtras { game_optimization: args.has("--game-optimization"), audio_on_host: args.has("--audio-on-host") },
-            };
+            let options = stream_options(&args).unwrap_or_else(|e| fail(&e));
+            let (width, height) = (options.width, options.height);
+            // `--persist`: perintah dari aplikasi lewat stdin, sambung ulang otomatis di jendela yang sama.
+            let control = args.has("--persist").then(cloudpc_stream_client::persist::Control::from_stdin);
             let limit = args.get("--seconds").map(|_| Duration::from_secs(u64::from(args.number("--seconds", 0))));
             let started = Instant::now();
             run_log::start(&data);
@@ -189,11 +189,14 @@ fn main() {
                 // Tampilan SDL memegang thread ini (aturan macOS); sesi jalan di thread lain.
                 let sdl_options = sdl_options(&args, width, height);
                 let (addr, data, options) = (addr.clone(), data.clone(), options.clone());
+                let base = Args { positional: args.positional.clone(), options: args.options.clone() };
                 let run = cloudpc_stream_client::frontend_sdl::run(sdl_options, move |mut sink, mut audio| {
                     let store = Store::open(&data)?;
                     let mut events = event_logger(started, "SDL");
-                    let outputs = session::Outputs { video: Some(&mut sink), audio: audio.as_mut().map(|a| a as &mut dyn session::AudioSink), events: Some(&mut events) };
-                    let result = session::run_with(&addr, &store, &options, outputs, || terminate::requested() || limit.is_some_and(|l| started.elapsed() >= l), |line| log_line(started, &line));
+                    let stopped = || terminate::requested() || limit.is_some_and(|l| started.elapsed() >= l);
+                    let log = |line: &str| log_line(started, line);
+                    let mut env = StreamEnv { addr: &addr, store: &store, video: Some(&mut sink), audio: audio.as_mut(), events: &mut events, stopped: &stopped, log: &log, base: &base };
+                    let result = cloudpc_stream_client::persist::run_series(&mut env, options, control.as_ref());
                     if quit_after {
                         quit_host(&addr, &store, started);
                     }
@@ -209,8 +212,8 @@ fn main() {
                 let mut display = open_display(&args, width, height);
                 let mut player = open_player(&args, display.is_some(), &log);
                 let mut events = event_logger(started, if display.is_some() { "D3D11VA" } else { "" });
-                let outputs = session::Outputs { video: display.as_mut().map(|d| d as &mut dyn session::VideoSink), audio: player.as_mut().map(|p| p as &mut dyn session::AudioSink), events: Some(&mut events) };
-                let result = session::run_with(&addr, &store, &options, outputs, stop, |line| log(&line));
+                let mut env = StreamEnv { addr: &addr, store: &store, video: display.as_mut(), audio: player.as_mut(), events: &mut events, stopped: &stop, log: &log, base: &args };
+                let result = cloudpc_stream_client::persist::run_series(&mut env, options, control.as_ref());
                 let shown = display.map(finish_display);
                 let audio_out = player.map(finish_player);
                 // `--quit-after`: tutup aplikasi di host begitu stream selesai (seperti Moonlight).
@@ -519,6 +522,74 @@ fn event_logger(started: Instant, renderer: &'static str) -> impl FnMut(session:
             session::Event::FirstVideoPacket(after) => log(&format!("Received first video packet after {} ms", after.as_millis())),
             session::Event::RfiRequest(frame) => log(&format!("Sending RFI request for unrecoverable frame {frame}")),
             session::Event::FirstRumble { pad, low, high } => log(&format!("Getar gamepad {pad} dari host (motor {low}/{high})")),
+        }
+    }
+}
+
+/// Opsi stream dari argumen baris perintah (juga untuk perintah `quality` dari stdin).
+fn stream_options(args: &Args) -> Result<StreamOptions, String> {
+    let app = args.positional.get(2).cloned().ok_or(USAGE)?;
+    let (width, height) = match args.get("--resolution") {
+        None => (1920, 1080),
+        Some(text) => text.split_once('x').and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?))).ok_or(format!("--resolution tidak valid: {text}"))?,
+    };
+    let number = |name: &str, default: u32| match args.get(name) {
+        None => Ok(default),
+        Some(text) => text.parse().map_err(|_| format!("{name} butuh angka, bukan \"{text}\"")),
+    };
+    Ok(StreamOptions {
+        app,
+        width,
+        height,
+        fps: number("--fps", 60)?,
+        bitrate_kbps: number("--bitrate", 20_000)?,
+        codec: parse_codec(args.get("--video-codec")),
+        dump_video: args.get("--dump-video").map(std::path::PathBuf::from),
+        launch: nvhttp::LaunchExtras { game_optimization: args.has("--game-optimization"), audio_on_host: args.has("--audio-on-host") },
+    })
+}
+
+/// Jendela, suara, dan sesi untuk `persist::run_series` (Windows D3D11 dan SDL).
+struct StreamEnv<'a, V: session::VideoSink, A: session::AudioSink> {
+    addr: &'a HostAddr,
+    store: &'a Store,
+    video: Option<&'a mut V>,
+    audio: Option<&'a mut A>,
+    events: &'a mut dyn FnMut(session::Event),
+    stopped: &'a dyn Fn() -> bool,
+    log: &'a dyn Fn(&str),
+    base: &'a Args,
+}
+
+impl<V: session::VideoSink, A: session::AudioSink> cloudpc_stream_client::persist::Env for StreamEnv<'_, V, A> {
+    fn run(&mut self, options: &StreamOptions, stop: &mut dyn FnMut() -> bool) -> Result<session::StreamReport, String> {
+        let outputs = session::Outputs {
+            video: self.video.as_deref_mut().map(|v| v as &mut dyn session::VideoSink),
+            audio: self.audio.as_deref_mut().map(|a| a as &mut dyn session::AudioSink),
+            events: Some(&mut *self.events),
+        };
+        let (stopped, log) = (self.stopped, self.log);
+        session::run_with(self.addr, self.store, options, outputs, || stopped() || stop(), |line| log(&line))
+    }
+    fn closed(&self) -> bool {
+        self.video.as_deref().is_some_and(|v| v.closed())
+    }
+    fn stopped(&self) -> bool {
+        (self.stopped)()
+    }
+    fn notify(&mut self, text: &str) {
+        (self.log)(text);
+        if let Some(video) = self.video.as_deref_mut() {
+            video.status(String::new(), Some(text.to_string()));
+        }
+    }
+    fn reapply(&mut self, options: &StreamOptions, words: &[String]) -> StreamOptions {
+        match stream_options(&self.base.with_overrides(words)) {
+            Ok(next) => next,
+            Err(e) => {
+                (self.log)(&format!("Perintah kualitas diabaikan: {e}"));
+                options.clone()
+            }
         }
     }
 }
