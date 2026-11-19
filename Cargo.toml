@@ -1,0 +1,21 @@
+# Stack streaming CloudPC di Rust: pengganti Sunshine (host) dan Moonlight (client), kompatibel protokol GameStream.
+# Workspace TERPISAH dari workspace root: kode di sini turunan dari Sunshine/Moonlight (GPLv3), jadi berlisensi
+# GPL-3.0 dan tidak boleh ditautkan (link) ke crate CloudPC lain. Lihat README.md.
+[workspace]
+resolver = "2"
+members = ["proto", "common", "host", "client"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "GPL-3.0-only"
+
+# Dependensi dioptimalkan juga di build debug: pembuatan kunci RSA 2048 tanpa optimasi bisa makan puluhan detik.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

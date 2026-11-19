@@ -1,0 +1,306 @@
+//! Client sungguhan melawan host CloudPC Rust sungguhan (di proses yang sama, 127.0.0.1): pairing, daftar aplikasi,
+//! satu sesi stream singkat, lalu quit. Host memakai mode uji: input hanya dicatat, audio hening.
+
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
+
+use cloudpc_stream_client::nvhttp::{self, HostAddr};
+use cloudpc_stream_client::session::{self, CodecChoice, StreamOptions};
+use cloudpc_stream_client::store::Store;
+use cloudpc_stream_host::nvhttp::{self as host_http, Host, HostConfig};
+use cloudpc_stream_host::state::write_pin;
+use cloudpc_stream_proto::control::packet_type;
+
+static NEXT_BASE: AtomicU16 = AtomicU16::new(0);
+
+struct Rig {
+    host: Arc<Host>,
+    addr: HostAddr,
+    state: tempfile::TempDir,
+    data: tempfile::TempDir,
+}
+
+/// Tes yang benar-benar men-stream bergiliran: dua host uji di satu proses berebut tangkapan layar (Desktop
+/// Duplication) dan yang kedua gagal.
+static STREAMING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn streaming() -> std::sync::MutexGuard<'static, ()> {
+    STREAMING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn rig() -> Rig {
+    rig_with(false)
+}
+
+fn rig_with(test_rumble: bool) -> Rig {
+    let state = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let start = 31000 + (std::process::id() % 1500) as u16 * 10;
+    for _ in 0..50 {
+        let base = start + NEXT_BASE.fetch_add(30, Ordering::SeqCst);
+        let cfg = HostConfig {
+            bind: "127.0.0.1".parse().unwrap(),
+            base_port: base,
+            name: "PC Uji".into(),
+            state_dir: state.path().to_path_buf(),
+            uniqueid: None,
+            pin_wait: Duration::from_secs(10),
+            verbose: false,
+            test_drop_video_every: 0,
+            test_drop_video_burst: 1,
+            test_silent_audio: true,
+            test_drop_audio_every: 0,
+            test_record_input: true,
+            test_rumble,
+        };
+        if let Ok(host) = host_http::start(cfg) {
+            return Rig { host, addr: HostAddr { host: "127.0.0.1".into(), http_port: base }, state, data };
+        }
+    }
+    panic!("tidak menemukan port bebas untuk host uji");
+}
+
+/// Pairing dari client; PIN dititipkan ke host sedikit kemudian, seperti agent saat sesi dimulai.
+fn pair(rig: &Rig, host_pin: &str, client_pin: &str) -> Result<String, String> {
+    let state = rig.state.path().to_path_buf();
+    let host_pin = host_pin.to_string();
+    let feeder = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(300));
+        write_pin(&state, &host_pin, "cloudpc-uji").unwrap();
+    });
+    let mut store = Store::open(rig.data.path()).unwrap();
+    let result = nvhttp::pair(&rig.addr, &mut store, client_pin);
+    feeder.join().unwrap();
+    result
+}
+
+#[test]
+fn wrong_pin_is_detected_by_the_client_and_nothing_is_remembered() {
+    let rig = rig();
+    let err = pair(&rig, "1111", "2222").unwrap_err();
+    assert!(err.contains("PIN salah"), "{err}");
+    assert!(rig.host.paired_names().is_empty());
+    let store = Store::open(rig.data.path()).unwrap();
+    let info = nvhttp::server_info(&rig.addr, &store).unwrap();
+    assert!(store.host(&info.uniqueid).is_none(), "host yang gagal dipairing tidak boleh diingat");
+    assert!(nvhttp::apps(&rig.addr, &store).unwrap_err().contains("belum dipairing"));
+}
+
+#[test]
+fn pair_list_stream_and_quit() {
+    let _turn = streaming();
+    let rig = rig();
+    assert_eq!(pair(&rig, "4821", "4821").unwrap(), "PC Uji");
+    assert_eq!(rig.host.paired_names(), ["cloudpc-uji"]);
+
+    let store = Store::open(rig.data.path()).unwrap();
+    let apps = nvhttp::apps(&rig.addr, &store).unwrap();
+    assert_eq!(apps.iter().map(|a| a.title.as_str()).collect::<Vec<_>>(), ["Desktop"]);
+    assert!(nvhttp::launch(&rig.addr, &store, "Tidak Ada", 1280, 720, 60).unwrap_err().contains("tidak ada di host"));
+
+    let dump = rig.data.path().join("video.h265");
+    let options = StreamOptions { app: "Desktop".into(), width: 1280, height: 720, fps: 60, bitrate_kbps: 10_000, codec: CodecChoice::Auto, dump_video: Some(dump.clone()), ..Default::default() };
+    let started = Instant::now();
+    let mut lines = Vec::new();
+    // Di tengah sesi: apa yang dilihat host dari client ini.
+    let mut seen_by_host = None;
+    let stop = || {
+        if seen_by_host.is_none() && started.elapsed() > Duration::from_secs(3) {
+            seen_by_host = rig.host.stream_snapshot();
+        }
+        started.elapsed() > Duration::from_secs(4)
+    };
+    let report = session::run(&rig.addr, &store, &options, stop, |line| lines.push(line)).unwrap();
+    let seen = seen_by_host.expect("host punya sesi stream yang aktif");
+    assert!(seen.control_connected && seen.client_name == "cloudpc-uji");
+    assert_eq!((seen.config.width, seen.config.height, seen.config.fps, seen.config.video_format), (1280, 720, 60, 1), "pilihan client sampai ke host lewat SDP");
+    for kind in [packet_type::REQUEST_IDR_FRAME, packet_type::START_B, packet_type::PERIODIC_PING] {
+        assert!(seen.messages.contains_key(&kind), "host menerima pesan 0x{kind:04x}: {:x?}", seen.messages);
+    }
+    assert!(seen.messages[&packet_type::PERIODIC_PING] >= 20, "ping tiap 100 ms: {:x?}", seen.messages);
+
+    // Host melihat sesi dari client ini: kanal kontrol tersambung, pembuka dan ping tiba terenkripsi.
+    assert!(report.connected_after < Duration::from_secs(3), "{lines:?}");
+    assert_eq!(report.encryption, 7, "host CloudPC mewajibkan enkripsi kontrol, video, dan audio");
+    assert_eq!(report.packet_size, 1392);
+    assert!(report.termination.is_none() && !report.disconnected);
+    assert!(report.audio_packets > 400, "audio 5 ms = ±200 paket/dtk: {report:?}");
+    if cloudpc_stream_host::video::capabilities().probed {
+        assert!(report.video_packets > 100, "layar ditangkap dan dikirim: {report:?}");
+        // Penghitung IV host naik satu per paket: di loopback praktis tidak ada yang hilang.
+        let lost = report.video_lost.expect("video terenkripsi, jadi kehilangan terukur");
+        assert!(lost * 50 < report.video_packets, "loopback kehilangan {lost} paket: {report:?}");
+        // C2: frame utuh tersusun, decoder mendapat aliran yang dimulai dari IDR.
+        assert!(report.video.frames > 30, "frame utuh dari host: {report:?}");
+        assert!(report.frames_decodable > 30 && report.video.invalid == 0, "{report:?}");
+        assert!(report.host_latency_ms.is_some(), "host CloudPC melaporkan latensi tangkap + encode");
+        let bytes = std::fs::read(&dump).unwrap();
+        assert!(bytes.starts_with(&[0, 0, 0, 1]), "Annex B dimulai kode awal");
+        // Unit NAL pertama HEVC dari IDR: VPS (jenis 32).
+        assert_eq!((bytes[4] >> 1) & 0x3F, 32, "aliran dimulai dari IDR (VPS/SPS/PPS)");
+    }
+
+    // Client sudah memutus kanal kontrol; aplikasi tetap "berjalan" sampai quit (perilaku Moonlight).
+    let (_, xml) = cloudpc_stream_client::http::get("127.0.0.1", rig.addr.http_port, "/serverinfo", None, Duration::from_secs(5)).unwrap();
+    assert_eq!(cloudpc_stream_client::http::tag(&xml, "currentgame").as_deref(), Some("1"), "aplikasi tetap berjalan setelah client pergi (seperti Sunshine)");
+    // Sambung lagi = resume.
+    let again = session::run(&rig.addr, &store, &options, || true, |_| {}).unwrap();
+    assert!(again.resumed, "aplikasi masih berjalan, jadi client melanjutkannya");
+
+    nvhttp::quit(&rig.addr, &store).unwrap();
+    assert!(rig.host.stream_snapshot().is_none() || {
+        thread::sleep(Duration::from_millis(500));
+        rig.host.stream_snapshot().is_none()
+    });
+    let again = nvhttp::launch(&rig.addr, &store, "Desktop", 1280, 720, 60).unwrap().1;
+    assert!(!again.resumed, "setelah quit, peluncuran berikutnya mulai baru");
+}
+
+/// C3: jendela + decode D3D11VA + tampil, untuk ketiga codec. Membuka jendela sungguhan dan butuh GPU dengan NVENC
+/// (host) dan decode hardware (client), jadi tidak ikut `cargo test` biasa:
+/// `cargo test -p cloudpc-stream-client --test against_host -- --ignored`.
+#[cfg(windows)]
+#[test]
+#[ignore]
+fn frames_are_decoded_and_shown_in_a_window() {
+    let _turn = streaming();
+    use cloudpc_stream_client::rtsp::Codec;
+    use cloudpc_stream_client::video::display::{Display, DisplayOptions};
+    assert!(cloudpc_stream_host::video::capabilities().probed, "butuh GPU NVIDIA untuk host uji");
+    let rig = rig();
+    pair(&rig, "4821", "4821").unwrap();
+    let store = Store::open(rig.data.path()).unwrap();
+    use cloudpc_stream_client::video::display::DecoderChoice;
+    let cases = [(Codec::Hevc, DecoderChoice::Auto), (Codec::Av1, DecoderChoice::Auto), (Codec::H264, DecoderChoice::Auto), (Codec::H264, DecoderChoice::Software), (Codec::Hevc, DecoderChoice::Software), (Codec::Av1, DecoderChoice::Software)];
+    for (codec, decoder) in cases {
+        let options = StreamOptions { app: "Desktop".into(), width: 1280, height: 720, fps: 60, bitrate_kbps: 10_000, codec: CodecChoice::Only(codec), dump_video: None, ..Default::default() };
+        let mut display = Display::open(DisplayOptions { title: format!("CloudPC uji {codec:?}"), width: 640, height: 360, fullscreen: false, input: cloudpc_stream_client::input::win::InputOptions { enabled: false, absolute_mouse: false, system_keys: cloudpc_stream_client::input::win::SystemKeys::Never }, decoder, stats: true, vsync: false }).unwrap();
+        let started = Instant::now();
+        let outputs = session::Outputs { video: Some(&mut display), ..Default::default() };
+        let report = session::run_with(&rig.addr, &store, &options, outputs, || started.elapsed() > Duration::from_secs(3), |_| {}).unwrap();
+        let shown = display.finish();
+        assert_eq!(shown.error, None, "{codec:?} {decoder:?}");
+        assert_eq!(shown.decoder.contains("perangkat lunak"), decoder == DecoderChoice::Software, "{shown:?}");
+        assert_eq!(shown.decode_errors, 0, "{codec:?}: {shown:?}");
+        assert!(shown.presented > 60, "{codec:?}: gambar tampil terus: {shown:?}, {report:?}");
+        assert!(shown.receive_to_present_ms < 16.0, "{codec:?}: tanpa antrean di client: {shown:?}");
+        nvhttp::quit(&rig.addr, &store).unwrap();
+    }
+}
+
+/// Jendela tiruan: mengirim satu paket gamepad, mencatat getar yang datang dari host.
+#[derive(Default)]
+struct PadSink {
+    sent: bool,
+    rumble: Vec<(u16, u16, u16)>,
+}
+
+impl session::VideoSink for PadSink {
+    fn start(&mut self, _: cloudpc_stream_client::rtsp::Codec) {}
+    fn frame(&mut self, _: cloudpc_stream_client::video::depacketize::VideoFrame) {}
+    fn take_idr_request(&mut self) -> bool {
+        false
+    }
+    fn closed(&self) -> bool {
+        false
+    }
+    fn take_input(&mut self) -> Vec<cloudpc_stream_client::input::InputPacket> {
+        if std::mem::replace(&mut self.sent, true) {
+            return Vec::new();
+        }
+        let pad = cloudpc_stream_proto::input::Gamepad { index: 0, active_mask: 1, buttons: 0x1000, ..Default::default() };
+        vec![cloudpc_stream_client::input::InputPacket { channel: cloudpc_stream_client::input::channel::GAMEPAD_BASE, data: cloudpc_stream_proto::input::gamepad(&pad) }]
+    }
+    fn rumble(&mut self, pad: u16, low: u16, high: u16) {
+        self.rumble.push((pad, low, high));
+    }
+}
+
+#[test]
+fn gamepad_rumble_from_the_host_reaches_the_client() {
+    let _turn = streaming();
+    let rig = rig_with(true);
+    pair(&rig, "4821", "4821").unwrap();
+    let store = Store::open(rig.data.path()).unwrap();
+    let options = StreamOptions { app: "Desktop".into(), width: 640, height: 360, fps: 30, bitrate_kbps: 2_000, codec: CodecChoice::Auto, dump_video: None, ..Default::default() };
+    let mut sink = PadSink::default();
+    let started = Instant::now();
+    let outputs = session::Outputs { video: Some(&mut sink), ..Default::default() };
+    let report = session::run_with(&rig.addr, &store, &options, outputs, || started.elapsed() > Duration::from_secs(3), |_| {}).unwrap();
+    assert_eq!(report.input_packets, 1);
+    // Host uji membalas paket gamepad pertama dengan getar (0x80, 0xFF) -> digeser 8 bit seperti Sunshine.
+    assert_eq!(sink.rumble, [(0, 0x8000, 0xFF00)], "{report:?}");
+    assert_eq!(report.rumble_messages, 1);
+    nvhttp::quit(&rig.addr, &store).unwrap();
+}
+
+/// Decoder tanpa jendela: GPU (D3D11VA di atas device D3D11 sendiri) dan CPU, untuk ketiga codec. Dipakai juga untuk
+/// menguji DLL FFmpeg lain (mis. build ramping): salin exe tes ini ke folder berisi DLL itu lalu jalankan dengan
+/// `--ignored decoders_work_without_a_window`.
+#[cfg(windows)]
+#[test]
+#[ignore]
+fn decoders_work_without_a_window() {
+    use cloudpc_stream_client::rtsp::Codec;
+    use cloudpc_stream_client::video::decode::Decoder;
+    use cloudpc_stream_client::video::depacketize::VideoFrame;
+    use cloudpc_stream_client::video::ff::CpuDecoder;
+    use windows::Win32::Foundation::HMODULE;
+    use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+    use windows::Win32::Graphics::Direct3D11::{D3D11CreateDevice, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION};
+
+    struct Decoding {
+        gpu: Option<Decoder>,
+        cpu: Option<CpuDecoder>,
+        device: windows::Win32::Graphics::Direct3D11::ID3D11Device,
+        counts: (u32, u32, u32),
+    }
+    impl session::VideoSink for Decoding {
+        fn start(&mut self, codec: Codec) {
+            self.gpu = Some(Decoder::new(codec, &self.device, true).unwrap());
+            self.cpu = Some(CpuDecoder::new(codec, false).unwrap());
+        }
+        fn frame(&mut self, frame: VideoFrame) {
+            match self.gpu.as_mut().unwrap().decode(&frame.data) {
+                Ok(Some(_)) => self.counts.0 += 1,
+                Ok(None) => {}
+                Err(_) => self.counts.2 += 1,
+            }
+            match self.cpu.as_mut().unwrap().decode(&frame.data) {
+                Ok(Some(p)) => {
+                    assert_eq!(p.nv12.len(), (p.width * p.height * 3 / 2) as usize);
+                    self.counts.1 += 1
+                }
+                Ok(None) => {}
+                Err(_) => self.counts.2 += 1,
+            }
+        }
+        fn take_idr_request(&mut self) -> bool {
+            false
+        }
+        fn closed(&self) -> bool {
+            false
+        }
+    }
+
+    let _turn = streaming();
+    eprintln!("FFmpeg {}", cloudpc_stream_client::video::ff::ffmpeg_version());
+    let rig = rig();
+    pair(&rig, "4821", "4821").unwrap();
+    let store = Store::open(rig.data.path()).unwrap();
+    for codec in [Codec::H264, Codec::Hevc, Codec::Av1] {
+        let mut device = None;
+        unsafe { D3D11CreateDevice(None, D3D_DRIVER_TYPE_HARDWARE, HMODULE::default(), D3D11_CREATE_DEVICE_VIDEO_SUPPORT, None, D3D11_SDK_VERSION, Some(&mut device), None, None) }.unwrap();
+        let mut sink = Decoding { gpu: None, cpu: None, device: device.unwrap(), counts: (0, 0, 0) };
+        let options = StreamOptions { app: "Desktop".into(), width: 1280, height: 720, fps: 30, bitrate_kbps: 8_000, codec: CodecChoice::Only(codec), ..Default::default() };
+        let started = Instant::now();
+        let outputs = session::Outputs { video: Some(&mut sink), ..Default::default() };
+        session::run_with(&rig.addr, &store, &options, outputs, || started.elapsed() > Duration::from_secs(3), |_| {}).unwrap();
+        let (gpu, cpu, errors) = sink.counts;
+        eprintln!("{codec:?}: GPU {gpu} frame, CPU {cpu} frame, galat {errors}");
+        assert!(gpu > 30 && cpu > 30 && errors == 0, "{codec:?}: {:?}", sink.counts);
+        nvhttp::quit(&rig.addr, &store).unwrap();
+    }
+}

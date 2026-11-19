@@ -1,0 +1,31 @@
+[package]
+name = "cloudpc-stream-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Client streaming CloudPC (pengganti Moonlight): terima, decode, tampilkan, kirim input"
+
+[dependencies]
+cloudpc-stream-proto = { path = "../proto" }
+cloudpc-stream-common = { path = "../common" }
+rand = "0.8"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rusty_enet = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+socket2 = "0.5"
+unsafe-libopus = "0.2"
+libloading = "0.9"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_Foundation", "Foundation_Numerics", "Win32_Graphics_Direct2D", "Win32_Graphics_Direct2D_Common", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_DirectWrite", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi", "Win32_Media_Audio", "Win32_Security", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_DataExchange", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Threading", "Win32_System_Variant", "Win32_UI_Input", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Input_XboxController", "Win32_UI_WindowsAndMessaging"] }
+
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3"
+
+[dev-dependencies]
+cloudpc-stream-host = { path = "../host" }
+tempfile = "3"

@@ -1,0 +1,112 @@
+# Client stream CloudPC untuk macOS (Apple Silicon): FFmpeg ramping n8.0.1 (VideoToolbox + dav1d), build + tes, bundel
+# dylib di samping program (install name @rpath, tanda tangan ad-hoc), uji decode VideoToolbox dan uji jendela + suara.
+# Workflow GitHub Actions (jalankan manual dari tab Actions atau `gh workflow run`).
+name: stream-rs-mac
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Runner macOS (arm64: macos-15; Intel: macos-15-intel)"
+        default: macos-15
+
+jobs:
+  mac:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Alat build
+        run: brew install nasm pkgconf dav1d sdl3
+
+      - name: FFmpeg ramping n8.0.1
+        run: |
+          git clone --depth 1 --branch n8.0.1 https://github.com/FFmpeg/FFmpeg.git ffmpeg
+          cd ffmpeg
+          ./configure --prefix="$GITHUB_WORKSPACE/ffmpeg-out" --install-name-dir=@rpath \
+            --enable-shared --disable-static --disable-programs --disable-doc --disable-network --disable-autodetect \
+            --disable-everything --disable-avdevice --disable-avformat --disable-avfilter --disable-swscale --disable-swresample \
+            --enable-videotoolbox --enable-libdav1d --enable-pthreads \
+            --enable-decoder=h264,hevc,av1,libdav1d --enable-parser=h264,hevc,av1 \
+            --enable-hwaccel=h264_videotoolbox,hevc_videotoolbox,av1_videotoolbox
+          make -j"$(sysctl -n hw.ncpu)"
+          make install
+          ls -la "$GITHUB_WORKSPACE/ffmpeg-out/lib"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Tes
+        working-directory: stream-rs
+        env:
+          FFMPEG_DIR: ${{ github.workspace }}/ffmpeg-out
+        run: |
+          cargo test -p cloudpc-stream-proto -p cloudpc-stream-common
+          cargo test -p cloudpc-stream-client --lib
+          cargo test -p cloudpc-stream-client --test decode_files
+
+      - name: Build release + bundel
+        env:
+          FFMPEG_DIR: ${{ github.workspace }}/ffmpeg-out
+        run: |
+          (cd stream-rs && cargo build --release -p cloudpc-stream-client)
+          OUT=stream-rs-mac
+          mkdir -p $OUT
+          cp stream-rs/target/release/cloudpc-stream-client $OUT/
+          cp ffmpeg-out/lib/libavcodec.62.dylib ffmpeg-out/lib/libavutil.60.dylib $OUT/
+          chmod u+w $OUT/*
+          # dav1d dan SDL3 dari Homebrew: salin, lalu arahkan semua rujukan ke @rpath (folder program).
+          DAV1D=$(otool -L $OUT/libavcodec.62.dylib | awk '/dav1d/ {print $1}')
+          cp "$(echo "$DAV1D" | sed "s|@rpath|$(brew --prefix dav1d)/lib|")" $OUT/ 2>/dev/null || cp "$(brew --prefix dav1d)/lib/$(basename "$DAV1D")" $OUT/
+          chmod u+w $OUT/*
+          install_name_tool -change "$DAV1D" "@rpath/$(basename "$DAV1D")" $OUT/libavcodec.62.dylib
+          install_name_tool -id "@rpath/$(basename "$DAV1D")" "$OUT/$(basename "$DAV1D")"
+          cp "$(brew --prefix sdl3)/lib/libSDL3.0.dylib" $OUT/
+          chmod u+w $OUT/*
+          install_name_tool -id @rpath/libSDL3.0.dylib $OUT/libSDL3.0.dylib
+          # Hapus rpath ke folder build supaya hanya folder program yang dipakai.
+          install_name_tool -delete_rpath "$GITHUB_WORKSPACE/ffmpeg-out/lib" $OUT/cloudpc-stream-client || true
+          for f in $OUT/*; do echo "== $f"; otool -L "$f" | tail -n +2; done
+          # Bundel hanya boleh merujuk dirinya sendiri (@rpath) dan macOS (/usr/lib, /System); rujukan lain
+          # (mis. Homebrew) membuat program gagal dimuat di Mac pemain.
+          if otool -L $OUT/* | grep -E "^[[:space:]]" | grep -vE "@rpath/|/usr/lib/|/System/Library/"; then
+            echo "Bundel merujuk pustaka di luar bundel/macOS"; exit 1
+          fi
+          codesign --force -s - $OUT/*.dylib $OUT/cloudpc-stream-client
+          cp stream-rs/LICENSE $OUT/LICENSE-cloudpc-stream.txt
+          cp ffmpeg/COPYING.LGPLv2.1 $OUT/FFMPEG-LICENSE.txt
+          ./$OUT/cloudpc-stream-client --version
+
+      - name: Uji decode dari bundel (VideoToolbox)
+        run: |
+          OUT=stream-rs-mac
+          D=stream-rs/client/tests/data
+          ./$OUT/cloudpc-stream-client decode-test $D/testsrc.h264 H.264
+          ./$OUT/cloudpc-stream-client decode-test $D/testsrc.hevc HEVC
+          ./$OUT/cloudpc-stream-client decode-test $D/testsrc.obu AV1
+          ./$OUT/cloudpc-stream-client decode-test $D/testsrc.hevc HEVC --video-decoder software
+
+      - name: Uji jendela + suara (SDL) dan tangkapan layar
+        run: |
+          OUT=stream-rs-mac
+          ./$OUT/cloudpc-stream-client self-test --seconds 6 > self-test.log 2>&1 &
+          PID=$!
+          sleep 3
+          screencapture -x self-test.png || true
+          wait $PID; STATUS=$?
+          cat self-test.log
+          exit $STATUS
+
+      - name: Arsip
+        if: always()
+        run: |
+          if [ -d stream-rs-mac ]; then ditto -c -k --keepParent stream-rs-mac stream-rs-mac.zip; fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stream-rs-mac-${{ inputs.runner }}
+          path: |
+            stream-rs-mac.zip
+            self-test.png
+            self-test.log
+          retention-days: 2

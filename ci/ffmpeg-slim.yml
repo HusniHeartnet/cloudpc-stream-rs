@@ -1,0 +1,62 @@
+# FFmpeg ramping untuk client stream CloudPC (stream-rs/client): hanya decoder H.264/HEVC/AV1, D3D11VA, dan dav1d
+# (AV1 di CPU). Versi n8.0.1 = header yang dipakai binding `client/src/video/ffi.rs`. Lisensi LGPL (tanpa komponen GPL).
+# Workflow GitHub Actions (jalankan manual dari tab Actions atau `gh workflow run`).
+name: ffmpeg-slim
+on: workflow_dispatch
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            git make nasm diffutils
+            mingw-w64-x86_64-gcc mingw-w64-x86_64-pkgconf mingw-w64-x86_64-dav1d
+
+      - name: Ambil source FFmpeg n8.0.1
+        run: git clone --depth 1 --branch n8.0.1 https://github.com/FFmpeg/FFmpeg.git ffmpeg
+
+      - name: Configure (hanya yang dipakai client)
+        run: |
+          cd ffmpeg
+          ./configure --prefix="$PWD/../out" --arch=x86_64 --target-os=mingw32 \
+            --enable-shared --disable-static --disable-programs --disable-doc --disable-network --disable-autodetect \
+            --disable-everything --disable-avdevice --disable-avformat --disable-avfilter --disable-swscale --disable-swresample \
+            --enable-w32threads --enable-d3d11va --enable-libdav1d \
+            --enable-decoder=h264,hevc,av1,libdav1d --enable-parser=h264,hevc,av1 \
+            --enable-hwaccel=h264_d3d11va,h264_d3d11va2,hevc_d3d11va,hevc_d3d11va2,av1_d3d11va,av1_d3d11va2 \
+            --pkg-config-flags=--static --extra-ldflags="-static-libgcc"
+          grep -E "^(decoders|hwaccels|parsers)" ffbuild/config.log || true
+
+      - name: Build
+        run: cd ffmpeg && make -j"$(nproc)" && make install
+
+      - name: Kumpulkan DLL dan ketergantungannya
+        run: |
+          mkdir -p dist
+          cp out/bin/*.dll dist/
+          # DLL MinGW yang ikut dibutuhkan (mis. libdav1d bila tidak tertaut statis).
+          for i in 1 2 3; do
+            for f in dist/*.dll; do
+              objdump -p "$f" | sed -n 's/.*DLL Name: //p' | while read -r dll; do
+                if [ -f "/mingw64/bin/$dll" ] && [ ! -f "dist/$dll" ]; then cp "/mingw64/bin/$dll" dist/; fi
+              done
+            done
+          done
+          cp ffmpeg/COPYING.LGPLv2.1 dist/FFMPEG-LICENSE.txt
+          echo "FFmpeg n8.0.1, configure: lihat ffmpeg-slim.yml di repo cloudpc-client" > dist/FFMPEG-SOURCE.txt
+          ls -la dist
+          for f in dist/*.dll; do echo "== $f"; objdump -p "$f" | sed -n 's/.*DLL Name: //p'; done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-slim-n8.0.1
+          path: dist
+          retention-days: 2

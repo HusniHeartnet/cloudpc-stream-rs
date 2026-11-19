@@ -1,0 +1,9 @@
+[package]
+name = "cloudpc-stream-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Format kawat protokol GameStream (dipakai host dan client), tanpa I/O"
+
+[dependencies]
+sha2 = "0.10"
