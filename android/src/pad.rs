@@ -254,7 +254,16 @@ pub fn vk_from_android(code: i32) -> Option<u16> {
         115 => 0x14, // Caps Lock
         117 => 0x5B, // Windows kiri (Meta)
         118 => 0x5C, // Windows kanan
+        82 => 0x5D,  // tombol Menu (klik kanan keyboard)
+        116 => 0x91, // Scroll Lock
         120 => 0x2C, // Print Screen (SYSRQ)
+        121 => 0x13, // Pause/Break
+        143 => 0x90, // Num Lock
+        154 => 0x6F, // numpad /
+        155 => 0x6A, // numpad *
+        156 => 0x6D, // numpad -
+        157 => 0x6B, // numpad +
+        158 => 0x6E, // numpad .
         122 => 0x24, // Home
         123 => 0x23, // End
         124 => 0x2D, // Insert
@@ -374,6 +383,13 @@ mod tests {
         assert_eq!(vk_from_android(54), Some(0x5A));
         assert_eq!(vk_from_android(16), Some(0x39));
         assert_eq!(vk_from_android(142), Some(0x7B));
+        // Keyboard fisik (OTG/Bluetooth): numpad dan tombol navigasi.
+        assert_eq!((vk_from_android(144), vk_from_android(153)), (Some(0x60), Some(0x69)));
+        assert_eq!((vk_from_android(154), vk_from_android(157), vk_from_android(158)), (Some(0x6F), Some(0x6B), Some(0x6E)));
+        assert_eq!((vk_from_android(143), vk_from_android(121), vk_from_android(82)), (Some(0x90), Some(0x13), Some(0x5D)));
+        assert_eq!((vk_from_android(111), vk_from_android(61), vk_from_android(117)), (Some(0x1B), Some(0x09), Some(0x5B)));
+        // Tombol media/volume tidak diteruskan (tetap milik HP).
+        assert_eq!((vk_from_android(24), vk_from_android(25), vk_from_android(85)), (None, None, None));
         assert_eq!(vk_from_android(4 /* BACK */), None);
 
         let mut kb = Keyboard::default();

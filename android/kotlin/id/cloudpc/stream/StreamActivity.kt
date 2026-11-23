@@ -117,6 +117,10 @@ class StreamActivity : Activity(), SurfaceHolder.Callback, InputManager.InputDev
     private var picture = intArrayOf(0, 0, 0, 0)
     private var gyroListening = false
     private var lastGyroNanos = 0L
+    /** Mouse fisik ditangkap untuk PC (bawaan). Ctrl+Alt+Shift+Z melepas/menangkap lagi, seperti di client desktop. */
+    private var mouseCaptureWanted = true
+    private var mouseCarry = floatArrayOf(0f, 0f)
+    private var touchpadLast: FloatArray? = null
 
     private lateinit var root: FrameLayout
     private lateinit var surfaceView: SurfaceView
@@ -145,7 +149,13 @@ class StreamActivity : Activity(), SurfaceHolder.Callback, InputManager.InputDev
         }
         streamSize = Pair(intent.getIntExtra(EXTRA_WIDTH, 1280).coerceAtLeast(16), intent.getIntExtra(EXTRA_HEIGHT, 720).coerceAtLeast(16))
 
-        root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+        root = FrameLayout(this).apply {
+            setBackgroundColor(Color.BLACK)
+            // Pointer capture (mouse fisik) hanya diberikan ke view yang bisa dan sedang memegang fokus.
+            isFocusable = true
+            isFocusableInTouchMode = true
+            defaultFocusHighlightEnabled = false
+        }
         surfaceView = SurfaceView(this)
         // Penyangga gambar seukuran stream; penyusun layar Android yang memperbesarnya ke ukuran tampilan.
         surfaceView.holder.setFixedSize(streamSize.first, streamSize.second)
@@ -237,6 +247,8 @@ class StreamActivity : Activity(), SurfaceHolder.Callback, InputManager.InputDev
 
         root.setOnTouchListener { _, event -> onStreamTouch(event) }
         root.setOnCapturedPointerListener { _, event -> onCapturedMouse(event) }
+        // Saat keyboard layar terbuka fokus ada di keyboardView, jadi mouse yang tertangkap dikirim ke sana.
+        keyboardView.setOnCapturedPointerListener { _, event -> onCapturedMouse(event) }
         root.addOnLayoutChangeListener { _, left, top, right, bottom, _, _, _, _ -> fitSurface(right - left, bottom - top) }
         setContentView(root)
 
@@ -304,7 +316,10 @@ class StreamActivity : Activity(), SurfaceHolder.Callback, InputManager.InputDev
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus) hideSystemBars()
+        if (hasFocus) {
+            hideSystemBars()
+            ensureMouseCaptured()  // Android melepas tangkapan mouse tiap jendela kehilangan fokus (menu, dialog)
+        }
     }
 
     // ---- hidup-matinya stream mengikuti Surface ----------------------------------------------------------------
@@ -362,6 +377,7 @@ class StreamActivity : Activity(), SurfaceHolder.Callback, InputManager.InputDev
         padView.invalidate()
         syncIcons()
         syncGyro()
+        ensureMouseCaptured()
         ui.removeCallbacks(poll)
         ui.postDelayed(poll, 300)
     }
@@ -449,8 +465,12 @@ class StreamActivity : Activity(), SurfaceHolder.Callback, InputManager.InputDev
         val current = handle
         if (current == 0L) return true
         if (event.getToolType(0) == MotionEvent.TOOL_TYPE_MOUSE) {
-            // Mouse fisik: tangkap penunjuknya; setelah itu gerak relatif datang lewat onCapturedMouse.
-            if (event.actionMasked == MotionEvent.ACTION_DOWN) root.requestPointerCapture()
+            // Mouse fisik yang belum tertangkap (mis. baru dilepas dengan Ctrl+Alt+Shift+Z): klik di layar menangkapnya
+            // lagi; setelah itu gerak relatif datang lewat onCapturedMouse.
+            if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+                mouseCaptureWanted = true
+                ensureMouseCaptured()
+            }
             return true
         }
         when (event.actionMasked) {
@@ -780,15 +800,63 @@ class StreamActivity : Activity(), SurfaceHolder.Callback, InputManager.InputDev
         else -> 0
     }
 
+    private fun mousePresent(): Boolean = InputDevice.getDeviceIds().any { id ->
+        val device = InputDevice.getDevice(id)
+        device != null && !device.isVirtual && (device.supportsSource(InputDevice.SOURCE_MOUSE) || device.supportsSource(InputDevice.SOURCE_TOUCHPAD))
+    }
+
+    /**
+     * Mouse OTG/Bluetooth: begitu ada, penunjuknya ditangkap untuk PC (kursor Android hilang, gerak dikirim relatif seperti
+     * mouse game). Tombol-tombol di layar tetap bisa disentuh jari. Dipanggil ulang tiap fokus kembali dan tiap mouse dicolok.
+     */
+    private fun ensureMouseCaptured() {
+        if (!mouseCaptureWanted || handle == 0L || !hasWindowFocus() || !mousePresent()) return
+        val target: View = if (keyboardShown) keyboardView else root
+        if (target.hasPointerCapture()) return
+        if (!target.isFocused) target.requestFocus()
+        target.requestPointerCapture()
+    }
+
+    private fun releaseMouse() {
+        root.releasePointerCapture()
+        keyboardView.releasePointerCapture()
+    }
+
+    /** Gerak relatif -> PC; sisa pecahan disimpan supaya gerak pelan tidak hilang. */
+    private fun moveMouse(current: Long, dx: Float, dy: Float) {
+        val fx = dx + mouseCarry[0]
+        val fy = dy + mouseCarry[1]
+        val ix = fx.toInt()
+        val iy = fy.toInt()
+        mouseCarry[0] = fx - ix
+        mouseCarry[1] = fy - iy
+        if (ix != 0 || iy != 0) Native.mouseMove(current, ix, iy)
+    }
+
     private fun onCapturedMouse(event: MotionEvent): Boolean {
         val current = handle
         if (current == 0L) return true
         when (event.actionMasked) {
             MotionEvent.ACTION_MOVE, MotionEvent.ACTION_HOVER_MOVE -> {
-                val dx = event.x.roundToInt()
-                val dy = event.y.roundToInt()
-                if (dx != 0 || dy != 0) Native.mouseMove(current, dx, dy)
+                if (event.isFromSource(InputDevice.SOURCE_TOUCHPAD)) {
+                    // Touchpad (keyboard ber-touchpad, laptop dok): yang dilaporkan posisi jari, jadi selisihnya dihitung sendiri.
+                    val last = touchpadLast
+                    if (last != null) moveMouse(current, event.x - last[0], event.y - last[1])
+                    touchpadLast = floatArrayOf(event.x, event.y)
+                } else {
+                    // Mouse: tiap sampel berisi gerak relatif. Android menggabungkan beberapa sampel dalam satu kejadian;
+                    // yang lama ada di "riwayat" dan HARUS ikut dijumlah, kalau tidak gerak cepat terasa patah/pendek.
+                    var dx = event.x
+                    var dy = event.y
+                    for (i in 0 until event.historySize) {
+                        dx += event.getHistoricalX(i)
+                        dy += event.getHistoricalY(i)
+                    }
+                    moveMouse(current, dx, dy)
+                }
             }
+            MotionEvent.ACTION_DOWN -> touchpadLast = if (event.isFromSource(InputDevice.SOURCE_TOUCHPAD)) floatArrayOf(event.x, event.y) else null
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> touchpadLast = null
             MotionEvent.ACTION_BUTTON_PRESS -> Native.mouseButton(current, mouseButtonOf(event.actionButton), true)
             MotionEvent.ACTION_BUTTON_RELEASE -> Native.mouseButton(current, mouseButtonOf(event.actionButton), false)
             MotionEvent.ACTION_SCROLL -> Native.scroll(current, (event.getAxisValue(MotionEvent.AXIS_VSCROLL) * 120f).roundToInt())
@@ -809,6 +877,17 @@ class StreamActivity : Activity(), SurfaceHolder.Callback, InputManager.InputDev
             else -> return false
         }
         val code = event.keyCode
+        // Pintasan keyboard fisik (sama dengan client desktop): Ctrl+Alt+Shift+Z lepas/tangkap mouse, +Q kembali ke aplikasi.
+        if (event.isCtrlPressed && event.isAltPressed && event.isShiftPressed && (code == KeyEvent.KEYCODE_Z || code == KeyEvent.KEYCODE_Q)) {
+            if (down && event.repeatCount == 0) {
+                if (code == KeyEvent.KEYCODE_Q) finish() else {
+                    mouseCaptureWanted = !mouseCaptureWanted
+                    if (mouseCaptureWanted) ensureMouseCaptured() else releaseMouse()
+                    Toast.makeText(this, if (mouseCaptureWanted) "Mouse dipakai untuk PC" else "Mouse dilepas (Ctrl+Alt+Shift+Z untuk memakai lagi)", Toast.LENGTH_SHORT).show()
+                }
+            }
+            return true
+        }
         val pad = event.isFromSource(InputDevice.SOURCE_GAMEPAD) || event.isFromSource(InputDevice.SOURCE_JOYSTICK) || KeyEvent.isGamepadButton(code)
         if (pad) {
             if (event.repeatCount > 0) return true
@@ -854,10 +933,22 @@ class StreamActivity : Activity(), SurfaceHolder.Callback, InputManager.InputDev
             )
             return true
         }
+        if (current != 0L && event.isFromSource(InputDevice.SOURCE_MOUSE)) {
+            when (event.actionMasked) {
+                // Mouse baru bergerak dan belum tertangkap (mis. fokus baru kembali): tangkap sekarang.
+                MotionEvent.ACTION_HOVER_MOVE, MotionEvent.ACTION_HOVER_ENTER -> ensureMouseCaptured()
+                MotionEvent.ACTION_SCROLL -> {
+                    Native.scroll(current, (event.getAxisValue(MotionEvent.AXIS_VSCROLL) * 120f).roundToInt())
+                    return true
+                }
+            }
+        }
         return super.dispatchGenericMotionEvent(event)
     }
 
-    override fun onInputDeviceAdded(deviceId: Int) {}
+    override fun onInputDeviceAdded(deviceId: Int) {
+        ensureMouseCaptured()
+    }
 
     override fun onInputDeviceChanged(deviceId: Int) {}
 
@@ -877,6 +968,9 @@ class StreamActivity : Activity(), SurfaceHolder.Callback, InputManager.InputDev
             manager.showSoftInput(keyboardView, 0)
         }
         keyboardShown = !keyboardShown
+        // Fokus pindah antara keyboardView dan root; tangkapan mouse ikut dipindah.
+        if (!keyboardShown) root.requestFocus()
+        ensureMouseCaptured()
         syncIcons()
     }
 
