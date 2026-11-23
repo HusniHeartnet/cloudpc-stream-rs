@@ -21,11 +21,15 @@ const USAGE: &str = "Perintah:
   cloudpc-stream-host unpair --state <folder> (--name NAMA | --prefix AWALAN)  cabut perangkat (sesinya ikut diakhiri)
   cloudpc-stream-host stop --state <folder>                                    akhiri sesi stream yang berjalan
   cloudpc-stream-host check-audio
+  cloudpc-stream-host mic-check [--port COM7] [--tone DETIK]     cari perangkat CloudPC Mic, baca laporannya; --tone = kirim nada 440 Hz
+  cloudpc-stream-host mic-bootloader [--port COM7]               perangkat CloudPC Mic masuk mode isi firmware (drive RPI-RP2)
   cloudpc-stream-host gpu-profile [--remove | --show PROFIL EXE]   profil driver NVIDIA \"prefer maximum performance\" untuk host
   cloudpc-stream-host ports [port_dasar]
   cloudpc-stream-host --version
 Tambahkan --json pada pin/clients/unpair/stop untuk keluaran yang dibaca program.
 Bawaan --bind 127.0.0.1 (hanya PC ini). run/supervise memasang profil driver NVIDIA host (seperti Sunshine) kecuali --no-gpu-profile.
+run --mic pico[:COM7]: terima suara mikrofon pemain dan keluarkan lewat perangkat CloudPC Mic (mikrofon USB);
+tanpa --mic host tidak menawarkan mikrofon ke client. --mic wav:<berkas> = tulis ke berkas (uji).
 Hanya untuk uji (perintah run): --test-drop-video N [--test-drop-burst B], --test-drop-audio N,
 --test-silent-audio dan --test-record-input (keduanya WAJIB bila client berjalan di mesin yang sama).";
 
@@ -186,6 +190,23 @@ fn main() {
             Ok((samples, peak)) => println!("Tangkapan suara OK: {samples} sampel dalam 2 detik, puncak {:.1}% dari maksimum.", peak * 100.0),
             Err(why) => fail(&format!("Tangkapan suara gagal: {why}")),
         },
+        Some("mic-check") => {
+            let seconds = u64::from(number(&args, "--tone", 0));
+            if seconds > 0 {
+                println!("Mengirim nada 440 Hz selama {seconds} detik. Rekam \"CloudPC Mic\" di Windows (Pengaturan > Suara > Input) untuk mendengarnya.");
+            }
+            match cloudpc_stream_host::mic::check_pico(option(&args, "--port").as_deref(), seconds, |line| println!("{line}")) {
+                Ok(()) => println!("Perangkat CloudPC Mic menjawab dengan benar."),
+                Err(why) => fail(&format!("Perangkat CloudPC Mic bermasalah: {why}")),
+            }
+        }
+        Some("mic-bootloader") => {
+            let result = cloudpc_stream_host::mic::PicoOutput::open(option(&args, "--port").as_deref()).and_then(|pico| pico.enter_bootloader());
+            match result {
+                Ok(()) => println!("Perintah terkirim. Perangkat muncul sebagai drive RPI-RP2; salin berkas .uf2 baru ke sana."),
+                Err(why) => fail(&format!("Gagal: {why}")),
+            }
+        }
         #[cfg(windows)]
         Some("gpu-profile") => {
             use cloudpc_stream_host::nvprefs;
@@ -255,6 +276,7 @@ fn main() {
                 test_drop_audio_every: number(&args, "--test-drop-audio", 0),
                 test_record_input: flag(&args, "--test-record-input"),
                 test_rumble: flag(&args, "--test-rumble"),
+                mic: option(&args, "--mic").map(|text| cloudpc_stream_host::mic::MicTarget::parse(&text).unwrap_or_else(|e| fail(&e))),
             };
             let host = nvhttp::start(cfg).unwrap_or_else(|e| fail(&e));
             let p = host.ports;

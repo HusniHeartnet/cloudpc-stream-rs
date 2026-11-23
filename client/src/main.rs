@@ -21,6 +21,7 @@ const USAGE: &str = "Perintah:
   cloudpc-stream-client quit <host[:port]>
   cloudpc-stream-client decode-test <berkas .h264|.hevc|.obu> <H.264|HEVC|AV1> [--video-decoder software]
   cloudpc-stream-client self-test [--seconds 5]      (jendela + suara tanpa host)
+  cloudpc-stream-client check-mic [--seconds 2]      (buka mikrofon bawaan, laporkan angka saja)
   cloudpc-stream-client --version
 Opsi umum: --data <folder> (bawaan %APPDATA%\\CloudPC\\stream-client).
 Opsi Moonlight lain yang tidak dikenal diterima dan diabaikan.
@@ -28,15 +29,19 @@ Opsi Moonlight lain yang tidak dikenal diterima dan diabaikan.
 Suara diputar di perangkat bawaan (--no-audio = tanpa suara). Input: keyboard, mouse (--absolute-mouse | bawaan relatif),
 gamepad XInput (--no-input = hanya menonton); --vsync, --quit-after, --audio-on-host, --game-optimization seperti Moonlight; --capture-system-keys never|fullscreen|always. Ctrl+Alt+Shift + Q keluar, X layar penuh, Z lepas input,
 M mode mouse, D kecilkan, V tempel teks, K tangkap tombol sistem, S statistik (--performance-overlay = tampil sejak awal). Log bergaya Moonlight (blok Global video stats).
+--microphone: kirim suara mikrofon ke host CloudPC yang punya keluaran mikrofon (--microphone-muted = mulai bisu); Ctrl+Alt+Shift+B bisu/nyala.
 --persist: jendela tetap sama saat koneksi putus (sambung ulang otomatis) dan saat ganti kualitas (baris stdin
 `quality --bitrate N --fps N --resolution WxH --video-codec C`), supaya Window Capture (TikTok LIVE, OBS) tidak hilang.";
 
 /// Opsi Moonlight yang berdiri sendiri (tanpa nilai).
-const FLAGS: [&str; 17] = [
+const FLAGS: [&str; 20] = [
     "--persist",
     "--performance-overlay",
     "--no-input",
     "--no-audio",
+    "--microphone",
+    "--microphone-muted",
+    "--test-mic-tone",
     "--headless",
     "--no-absolute-mouse",
     "--absolute-mouse",
@@ -164,6 +169,19 @@ fn main() {
                 Err(e) => fail(&format!("Decode gagal: {e}")),
             }
         }
+        Some("check-mic") => {
+            // Buka mikrofon bawaan sebentar dan laporkan angka saja; suaranya tidak disimpan dan tidak dikirim.
+            let seconds = u64::from(args.number("--seconds", 2));
+            let microphone = cloudpc_stream_client::mic::Microphone::open(false).unwrap_or_else(|e| fail(&format!("Mikrofon tidak bisa dipakai: {e}")));
+            std::thread::sleep(Duration::from_secs(seconds));
+            let stats = microphone.stats();
+            let trouble = microphone.take_trouble();
+            drop(microphone);
+            println!("Mikrofon terbaca: {} paket ({:.1} dtk suara) dalam {seconds} dtk, tingkat puncak {:.1}%", stats.packets, stats.packets as f64 * 0.02, f64::from(stats.peak_permille) / 10.0);
+            if let Some(trouble) = trouble {
+                println!("Catatan perangkat: {trouble}");
+            }
+        }
         Some("self-test") => {
             // Uji jendela + suara tanpa host (mis. di Mac baru): pola uji bergerak dan nada 440 Hz.
             let seconds = u64::from(args.number("--seconds", 5));
@@ -195,7 +213,8 @@ fn main() {
                     let mut events = event_logger(started, "SDL");
                     let stopped = || terminate::requested() || limit.is_some_and(|l| started.elapsed() >= l);
                     let log = |line: &str| log_line(started, line);
-                    let mut env = StreamEnv { addr: &addr, store: &store, video: Some(&mut sink), audio: audio.as_mut(), events: &mut events, stopped: &stopped, log: &log, base: &base };
+                    let mut microphone = open_microphone(&base, &log);
+                    let mut env = StreamEnv { addr: &addr, store: &store, video: Some(&mut sink), audio: audio.as_mut(), mic: microphone.as_mut(), events: &mut events, stopped: &stopped, log: &log, base: &base };
                     let result = cloudpc_stream_client::persist::run_series(&mut env, options, control.as_ref());
                     if quit_after {
                         quit_host(&addr, &store, started);
@@ -212,8 +231,12 @@ fn main() {
                 let mut display = open_display(&args, width, height);
                 let mut player = open_player(&args, display.is_some(), &log);
                 let mut events = event_logger(started, if display.is_some() { "D3D11VA" } else { "" });
-                let mut env = StreamEnv { addr: &addr, store: &store, video: display.as_mut(), audio: player.as_mut(), events: &mut events, stopped: &stop, log: &log, base: &args };
+                let mut microphone = open_microphone(&args, &log);
+                let mut env = StreamEnv { addr: &addr, store: &store, video: display.as_mut(), audio: player.as_mut(), mic: microphone.as_mut(), events: &mut events, stopped: &stop, log: &log, base: &args };
                 let result = cloudpc_stream_client::persist::run_series(&mut env, options, control.as_ref());
+                if let Some(stats) = microphone.as_ref().map(|m| m.stats()) {
+                    log(&format!("Ringkasan: mikrofon {} paket direkam, {} dibuang (antrean penuh), perangkat dibuka {} kali", stats.packets, stats.dropped, stats.opens));
+                }
                 let shown = display.map(finish_display);
                 let audio_out = player.map(finish_player);
                 // `--quit-after`: tutup aplikasi di host begitu stream selesai (seperti Moonlight).
@@ -254,6 +277,9 @@ fn main() {
                 audio_out.map(|text| format!(", {text}")).unwrap_or_default(),
                 report.input_packets
             ));
+            if report.mic_packets > 0 || report.mic_refused {
+                log(&format!("Ringkasan: mikrofon {} paket dikirim{}", report.mic_packets, if report.mic_refused { " (host tidak mendukung mikrofon)" } else { "" }));
+            }
             print_global_stats(&report, shown.as_ref(), &log);
             match (report.termination, report.disconnected) {
                 (Some(code), _) => log(&format!("Connection terminated: {}", code as i32)),
@@ -449,6 +475,30 @@ impl session::AudioSink for NoPlayer {
     fn samples(&mut self, _: &[f32]) {}
 }
 
+/// Mikrofon hanya direkam bila diminta (`--microphone`; `--microphone-muted` = mulai bisu, dinyalakan dengan
+/// Ctrl+Alt+Shift+B). Tanpa mikrofon atau izin ditolak: stream tetap jalan tanpa suara pemain.
+fn open_microphone(args: &Args, log: &dyn Fn(&str)) -> Option<cloudpc_stream_client::mic::Microphone> {
+    use cloudpc_stream_client::mic::Microphone;
+    let muted = args.has("--microphone-muted");
+    let opened = if args.has("--test-mic-tone") {
+        Microphone::test_tone()
+    } else if args.has("--microphone") || muted {
+        Microphone::open(muted)
+    } else {
+        return None;
+    };
+    match opened {
+        Ok(microphone) => {
+            log(if muted { "Mikrofon siap (dibisukan; Ctrl+Alt+Shift+B untuk menyalakan)" } else { "Mikrofon menyala (Ctrl+Alt+Shift+B untuk membisukan)" });
+            Some(microphone)
+        }
+        Err(error) => {
+            log(&format!("Mikrofon tidak bisa dipakai: {error}"));
+            None
+        }
+    }
+}
+
 /// Suara diputar bila ada jendela (bukan `--headless`) dan tidak `--no-audio`. Tanpa perangkat suara: tetap jalan.
 #[cfg(windows)]
 fn open_player(args: &Args, with_display: bool, log: &dyn Fn(&str)) -> Option<PlayerHandle> {
@@ -555,6 +605,7 @@ struct StreamEnv<'a, V: session::VideoSink, A: session::AudioSink> {
     store: &'a Store,
     video: Option<&'a mut V>,
     audio: Option<&'a mut A>,
+    mic: Option<&'a mut cloudpc_stream_client::mic::Microphone>,
     events: &'a mut dyn FnMut(session::Event),
     stopped: &'a dyn Fn() -> bool,
     log: &'a dyn Fn(&str),
@@ -567,6 +618,7 @@ impl<V: session::VideoSink, A: session::AudioSink> cloudpc_stream_client::persis
             video: self.video.as_deref_mut().map(|v| v as &mut dyn session::VideoSink),
             audio: self.audio.as_deref_mut().map(|a| a as &mut dyn session::AudioSink),
             events: Some(&mut *self.events),
+            mic: self.mic.as_deref_mut().map(|m| m as &mut dyn session::MicSource),
         };
         let (stopped, log) = (self.stopped, self.log);
         session::run_with(self.addr, self.store, options, outputs, || stopped() || stop(), |line| log(&line))

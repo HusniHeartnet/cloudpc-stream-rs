@@ -10,6 +10,7 @@ pub mod audio;
 pub mod control;
 pub mod fec;
 pub mod input;
+pub mod mic;
 pub mod pairing;
 pub mod ports;
 pub mod rtp;

@@ -6,6 +6,7 @@ pub mod control;
 pub use cloudpc_stream_common::crypto;
 pub mod http;
 pub mod input;
+pub mod mic;
 pub mod nvhttp;
 #[cfg(windows)]
 pub mod nvprefs;

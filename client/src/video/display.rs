@@ -259,6 +259,8 @@ impl VideoSink for Display {
 fn run(mut renderer: Renderer, rx: Receiver<Message>, wake: &Wake, closed: &AtomicBool, need_idr: &AtomicBool, report: &Mutex<DisplayReport>, hardware: &[Codec], choice: DecoderChoice, stats: bool) {
     let mut decoder: Option<Decoder> = None;
     let (mut show_stats, mut network, mut warning) = (stats, String::new(), None::<String>);
+    // Pemberitahuan singkat (mikrofon dibisukan/menyala), tampil di tempat peringatan selama beberapa detik.
+    let mut notice: Option<(String, Instant)> = None;
     // Angka thread ini untuk overlay, dihitung ulang tiap detik.
     let (mut second_start, mut second_presented, mut second_decode, mut second_latency, mut second_decoded) = (Instant::now(), 0u64, Duration::ZERO, Duration::ZERO, 0u64);
     let mut local_line = String::new();
@@ -304,6 +306,7 @@ fn run(mut renderer: Renderer, rx: Receiver<Message>, wake: &Wake, closed: &Atom
                 }
                 Shortcut::Minimize => renderer.minimize(),
                 Shortcut::ToggleStats => show_stats = !show_stats,
+                Shortcut::ToggleMic => notice = Some((crate::mic::toggle_notice(), Instant::now())),
                 _ => {}
             }
         }
@@ -365,7 +368,7 @@ fn run(mut renderer: Renderer, rx: Receiver<Message>, wake: &Wake, closed: &Atom
             watch.stage(6);
             let render_started = Instant::now();
             let stats = show_stats.then(|| format!("{network}\n{local_line}\nCtrl+Alt+Shift+S: tutup statistik"));
-            if let Err(error) = renderer.present(&picture, stats.as_deref(), warning.as_deref()) {
+            if let Err(error) = renderer.present(&picture, stats.as_deref(), notice.as_ref().filter(|(_, since)| since.elapsed() < Duration::from_secs(3)).map(|(text, _)| text.as_str()).or(warning.as_deref())) {
                 // Galat sesaat (mis. ukuran berubah saat Alt+Tab dari layar penuh) dulu langsung menutup stream. Sekarang
                 // dicatat dan dicoba lagi di frame berikutnya; baru menyerah bila gagal terus ±1 detik.
                 present_failures += 1;

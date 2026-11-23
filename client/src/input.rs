@@ -47,6 +47,8 @@ pub enum Shortcut {
     Paste,
     ToggleSystemKeys,
     ToggleStats,
+    /// Bisukan/nyalakan mikrofon (ekstensi CloudPC; tidak ada di Moonlight).
+    ToggleMic,
 }
 
 const VK_SHIFT: u16 = 0x10;
@@ -130,6 +132,7 @@ impl Keys {
             0x56 => Shortcut::Paste,            // V
             0x4B => Shortcut::ToggleSystemKeys, // K
             0x53 => Shortcut::ToggleStats,      // S
+            0x42 => Shortcut::ToggleMic,        // B (bisu/bicara)
             _ => return None,
         })
     }
@@ -600,7 +603,7 @@ pub mod win {
                 }
             }
             Shortcut::Minimize => set_captured(s, false),
-            Shortcut::Quit | Shortcut::ToggleFullscreen | Shortcut::ToggleStats => {}
+            Shortcut::Quit | Shortcut::ToggleFullscreen | Shortcut::ToggleStats | Shortcut::ToggleMic => {}
         }
         s.actions.push(shortcut);
     }
@@ -736,6 +739,7 @@ mod tests {
         keys.update(VK_LSHIFT, true);
         assert_eq!(keys.shortcut(0x51), Some(Shortcut::Quit));
         assert_eq!(keys.shortcut(0x5A), Some(Shortcut::ToggleCapture));
+        assert_eq!(keys.shortcut(0x42), Some(Shortcut::ToggleMic));
         assert_eq!(keys.shortcut(0x41), None);
         let released = keys.release_all();
         assert_eq!(released.len(), 3);

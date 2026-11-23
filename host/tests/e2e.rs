@@ -41,7 +41,7 @@ fn rig(pin_wait: Duration) -> Rig {
     let start = 21000 + (std::process::id() % 2000) as u16 * 10;
     for _ in 0..50 {
         let base = start + NEXT_BASE.fetch_add(30, Ordering::SeqCst);
-        let cfg = HostConfig { bind: "127.0.0.1".parse().unwrap(), base_port: base, name: "PC Uji <1>".into(), state_dir: state.path().to_path_buf(), uniqueid: None, pin_wait, verbose: false, test_drop_video_every: 0, test_drop_video_burst: 1, test_silent_audio: true, test_drop_audio_every: 0, test_record_input: true, test_rumble: false };
+        let cfg = HostConfig { bind: "127.0.0.1".parse().unwrap(), base_port: base, name: "PC Uji <1>".into(), state_dir: state.path().to_path_buf(), uniqueid: None, pin_wait, verbose: false, test_drop_video_every: 0, test_drop_video_burst: 1, test_silent_audio: true, test_drop_audio_every: 0, test_record_input: true, test_rumble: false, mic: None };
         if let Ok(host) = nvhttp::start(cfg) {
             return Rig { host, state, client, _client_dir: client_dir };
         }

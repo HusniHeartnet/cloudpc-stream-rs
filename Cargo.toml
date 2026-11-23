@@ -3,7 +3,7 @@
 # GPL-3.0 dan tidak boleh ditautkan (link) ke crate CloudPC lain. Lihat README.md.
 [workspace]
 resolver = "2"
-members = ["proto", "common", "host", "client"]
+members = ["proto", "common", "host", "client", "android"]
 
 [workspace.package]
 version = "0.0.1"

@@ -12,6 +12,7 @@ aes-gcm = "0.10"
 rand = "0.8"
 rcgen = "0.13"
 rsa = { version = "0.9", features = ["sha2"] }
+unsafe-libopus = "0.2"
 x509-cert = { version = "0.2", features = ["pem"] }
 
 [target.'cfg(windows)'.dependencies]

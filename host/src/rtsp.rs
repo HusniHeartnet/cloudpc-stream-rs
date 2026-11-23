@@ -55,7 +55,7 @@ fn respond(host: &Host, launch_id: u32, request: &Request) -> Response {
     let cseq = request.cseq();
     match request.command.as_str() {
         "OPTIONS" | "PLAY" => Response::new(200, "OK", cseq),
-        "DESCRIBE" => Response::new(200, "OK", cseq).with_payload(describe(crate::video::capabilities())),
+        "DESCRIBE" => Response::new(200, "OK", cseq).with_payload(describe(crate::video::capabilities(), host.mic_enabled())),
         "SETUP" => setup(host, launch_id, request),
         "ANNOUNCE" => announce(host, launch_id, request),
         _ => Response::new(404, "NOT FOUND", cseq),
@@ -63,7 +63,7 @@ fn respond(host: &Host, launch_id: u32, request: &Request) -> Response {
 }
 
 /// Kemampuan host. Enkripsi kontrol, video, dan audio didukung DAN diminta (wajib, lihat `StreamConfig::from_sdp`).
-fn describe(video: VideoCapabilities) -> String {
+fn describe(video: VideoCapabilities, mic: bool) -> String {
     let all = encryption::CONTROL_V2 | encryption::VIDEO | encryption::AUDIO;
     let mut lines = vec![
         "a=x-ss-general.featureFlags:0".to_string(),
@@ -83,7 +83,10 @@ fn describe(video: VideoCapabilities) -> String {
     }
     // Opus stereo: 2 kanal, 1 stream, 1 coupled, pemetaan 0,1 (kualitas normal dan tinggi). Surround menyusul di H3.
     lines.push("a=fmtp:97 surround-params=21101".to_string());
-    lines.push("a=fmtp:97 surround-params=21101".to_string());
+    // Ekstensi CloudPC: host punya keluaran mikrofon, client boleh mengirim suara pemain (`proto::mic`).
+    if mic {
+        lines.push(format!("a={}:{}", cloudpc_stream_proto::mic::SDP_ATTRIBUTE, cloudpc_stream_proto::mic::VERSION));
+    }
     lines.into_iter().map(|line| line + "\n").collect()
 }
 
@@ -160,7 +163,9 @@ mod tests {
     #[test]
     fn describe_requests_full_encryption_and_advertises_codecs() {
         let all = VideoCapabilities { h264: true, hevc: true, av1: true, ref_invalidation: true, probed: true };
-        let sdp = describe(all);
+        let sdp = describe(all, false);
+        assert!(!sdp.contains("x-cloudpc-mic"), "tanpa keluaran mikrofon host tidak menawarkannya");
+        assert_eq!(sdp_attributes(describe(all, true).as_bytes()).get("x-cloudpc-mic").map(String::as_str), Some("1"));
         let attrs = sdp_attributes(sdp.as_bytes());
         assert_eq!(attrs.get("x-ss-general.encryptionSupported").map(String::as_str), Some("7"));
         assert_eq!(attrs.get("x-ss-general.encryptionRequested").map(String::as_str), Some("7"));
@@ -168,7 +173,7 @@ mod tests {
         assert!(sdp.contains("sprop-parameter-sets=AAAAAU\n") && sdp.contains("AV1/90000\n"));
 
         // GPU tanpa HEVC/AV1/RFI tidak boleh menawarkannya.
-        let basic = describe(VideoCapabilities { hevc: false, av1: false, ref_invalidation: false, ..all });
+        let basic = describe(VideoCapabilities { hevc: false, av1: false, ref_invalidation: false, ..all }, false);
         assert!(!basic.contains("sprop-parameter-sets") && !basic.contains("AV1") && !basic.contains("refPicInvalidation"));
         assert!(basic.contains("encryptionRequested:7"));
     }

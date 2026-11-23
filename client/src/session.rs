@@ -61,11 +61,22 @@ pub trait VideoSink {
     fn rumble(&mut self, _pad: u16, _low: u16, _high: u16) {}
     /// Tiap detik: ringkasan jaringan (untuk overlay statistik) dan peringatan koneksi lambat bila ada.
     fn status(&mut self, _network: String, _warning: Option<String>) {}
+    /// Tiap detik, bersama `status`: angka ringkas satu detik terakhir (FPS diterima, Mbit/dtk, waktu pulang-pergi ms).
+    fn numbers(&mut self, _fps: f64, _mbps: f64, _rtt_ms: u32) {}
 }
 
 /// Tujuan suara yang sudah didecode (PCM float stereo 48 kHz, berselang kiri/kanan).
 pub trait AudioSink {
     fn samples(&mut self, pcm: &[f32]);
+}
+
+/// Sumber suara mikrofon pemain: paket Opus 20 ms (`proto::mic`) yang siap dikirim.
+pub trait MicSource {
+    fn take_packets(&mut self) -> Vec<Vec<u8>>;
+    /// Galat perangkat rekam sejak pemanggilan terakhir, untuk log.
+    fn take_trouble(&mut self) -> Option<String> {
+        None
+    }
 }
 
 /// Kejadian penting selama sesi, untuk log bergaya Moonlight (`main.rs`).
@@ -108,6 +119,10 @@ pub struct StreamReport {
     pub network_rtt_ms: Option<(f64, f64)>,
     pub audio: crate::audio::AudioStats,
     pub input_packets: u64,
+    /// Paket suara mikrofon yang dikirim ke host.
+    pub mic_packets: u64,
+    /// Mikrofon diminta tetapi host tidak menawarkannya (Sunshine, atau host tanpa perangkat mikrofon).
+    pub mic_refused: bool,
     pub rumble_messages: u64,
     pub host_messages: u64,
     pub termination: Option<u32>,
@@ -168,6 +183,13 @@ impl StatusWindow {
         }
         let poor = self.history.len() >= 3 && (frame_loss >= 5.0 || packet_loss >= 10.0 || sample.rtt.0 > 150);
         (text, poor.then(|| "Koneksi ke PC lambat: coba turunkan bitrate".to_string()))
+    }
+
+    /// Angka satu detik terakhir untuk tampilan ringkas: (FPS diterima, Mbit/dtk, waktu pulang-pergi ms).
+    pub fn latest(&self) -> (f64, f64, u32) {
+        let Some(last) = self.history.back().copied() else { return (0.0, 0.0, 0) };
+        let previous = self.history.iter().rev().nth(1).copied().unwrap_or_default();
+        (last.frames.saturating_sub(previous.frames) as f64, last.bytes.saturating_sub(previous.bytes) as f64 * 8.0 / 1e6, last.rtt.0)
     }
 }
 
@@ -249,6 +271,7 @@ pub struct Outputs<'a> {
     pub video: Option<&'a mut dyn VideoSink>,
     pub audio: Option<&'a mut dyn AudioSink>,
     pub events: Option<&'a mut dyn FnMut(Event)>,
+    pub mic: Option<&'a mut dyn MicSource>,
 }
 
 /// Seperti `run`, dengan frame dikirim ke `sink` (decode + tampil). Sesi juga berakhir bila jendela `sink` ditutup.
@@ -267,7 +290,7 @@ pub fn run_with(
     let (info, launched) = nvhttp::launch_with(addr, store, &options.app, options.width, options.height, options.fps, options.launch)?;
     progress(format!("{} {} di {} ({})", if launched.resumed { "Melanjutkan" } else { "Memulai" }, options.app, info.hostname, launched.session_url));
 
-    let Outputs { video: mut sink, audio: mut audio_sink, events: mut event_sink } = outputs;
+    let Outputs { video: mut sink, audio: mut audio_sink, events: mut event_sink, mic: mut mic_source } = outputs;
     let mut emit = |event: Event| {
         if let Some(sink) = event_sink.as_deref_mut() {
             sink(event);
@@ -333,6 +356,11 @@ pub fn run_with(
     let (mut rtt_sum, mut rtt_var_sum, mut rtt_samples) = (0u64, 0u64, 0u64);
     let mut next_rtt = start + Duration::from_secs(1);
     let mut status = StatusWindow::default();
+    let mut mic_sequence = 0u16;
+    if mic_source.is_some() {
+        report.mic_refused = !negotiated.offer.mic;
+        progress(if negotiated.offer.mic { "Mikrofon: host menerima suara pemain".into() } else { "Mikrofon: host ini tidak mendukung mikrofon, suara tidak dikirim".to_string() });
+    }
 
     while !stop() && !sink.as_deref().is_some_and(|s| s.closed()) {
         let now = Instant::now();
@@ -340,6 +368,19 @@ pub fn run_with(
             for packet in video_sink.take_input() {
                 link.send_input(packet.channel, &packet.data);
                 report.input_packets += 1;
+            }
+        }
+        if let Some(mic) = mic_source.as_deref_mut() {
+            // Antrean selalu dikosongkan; ke host yang tidak menawarkan mikrofon paketnya dibuang.
+            for packet in mic.take_packets() {
+                if negotiated.offer.mic {
+                    link.send_mic(mic_sequence, &packet);
+                    mic_sequence = mic_sequence.wrapping_add(1);
+                    report.mic_packets += 1;
+                }
+            }
+            if let Some(trouble) = mic.take_trouble() {
+                progress(format!("Mikrofon: {trouble}"));
             }
         }
         if now >= next_rtt {
@@ -366,6 +407,8 @@ pub fn run_with(
                 };
                 let (text, warning) = status.update(sample, &params);
                 sink.status(text, warning);
+                let (fps, mbps, rtt_ms) = status.latest();
+                sink.numbers(fps, mbps, rtt_ms);
             }
         }
         if sink.as_deref_mut().is_some_and(|s| s.take_idr_request()) {

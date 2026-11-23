@@ -92,6 +92,13 @@ impl ControlLink {
         self.send(packet_type::INPUT_DATA, packet, channel, true);
     }
 
+    /// Satu paket suara mikrofon (ekstensi CloudPC, `proto::mic`): kanal sendiri, tidak dijamin sampai. Hanya dipanggil
+    /// untuk host yang menawarkan mikrofon.
+    pub fn send_mic(&mut self, sequence: u16, opus: &[u8]) {
+        let payload = cloudpc_stream_proto::mic::encode(sequence, opus);
+        self.send(cloudpc_stream_proto::mic::PACKET_TYPE, &payload, cloudpc_stream_proto::mic::ENET_CHANNEL, false);
+    }
+
     /// Waktu pulang-pergi ENet ke host dan variasinya (milidetik), seperti statistik Moonlight.
     pub fn round_trip(&mut self) -> (u32, u32) {
         let peer = self.enet.peer_mut(self.peer);

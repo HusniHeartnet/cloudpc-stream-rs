@@ -6,3 +6,4 @@ pub mod identity;
 pub mod secure;
 #[cfg(windows)]
 pub mod streaming_mode;
+pub mod voice;

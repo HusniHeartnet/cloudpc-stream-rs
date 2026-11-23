@@ -20,5 +20,6 @@ pub mod frontend_sdl;
 pub mod gamepad;
 pub mod sdl;
 pub mod input;
+pub mod mic;
 #[cfg(target_os = "macos")]
 pub mod macos_activity;

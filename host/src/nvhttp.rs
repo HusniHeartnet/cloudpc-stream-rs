@@ -60,6 +60,8 @@ pub struct HostConfig {
     pub test_record_input: bool,
     /// Uji: kirim satu pesan getar palsu ke client begitu paket gamepad pertama tiba (tanpa ViGEm).
     pub test_rumble: bool,
+    /// Keluaran suara mikrofon pemain (`--mic`). `None` = host tidak menawarkan mikrofon ke client.
+    pub mic: Option<crate::mic::MicTarget>,
 }
 
 /// Dari mana permintaan datang.
@@ -115,6 +117,8 @@ pub struct Host {
     pub(crate) desktop_size: Mutex<(u32, u32)>,
     pub(crate) recorded_input: Mutex<Vec<crate::input::Action>>,
     control_tx: Mutex<Sender<Command>>,
+    /// Paket mikrofon dari kanal kontrol ke thread mikrofon (`None` = mikrofon tidak dinyalakan).
+    mic_tx: Option<Mutex<Sender<crate::mic::MicMessage>>>,
 }
 
 fn random16() -> [u8; 16] {
@@ -153,6 +157,13 @@ pub fn start(cfg: HostConfig) -> Result<Arc<Host>, String> {
     let audio = UdpSocket::bind((cfg.bind, ports.audio)).map_err(|e| format!("gagal membuka UDP {}:{}: {e}", cfg.bind, ports.audio))?;
     let (control_tx, control_rx) = mpsc::channel();
     let video_caps = crate::video::capabilities();
+    let (mic_tx, mic_thread) = match cfg.mic.clone() {
+        Some(target) => {
+            let (tx, rx) = mpsc::channel();
+            (Some(Mutex::new(tx)), Some((target, rx)))
+        }
+        None => (None, None),
+    };
     let host = Arc::new(Host {
         cfg,
         ports,
@@ -167,6 +178,7 @@ pub fn start(cfg: HostConfig) -> Result<Arc<Host>, String> {
         desktop_size: Mutex::new((0, 0)),
         recorded_input: Mutex::new(Vec::new()),
         control_tx: Mutex::new(control_tx),
+        mic_tx,
     });
     host.log(|| format!("encoder: {video_caps:?}"));
     // Agent mengatur host lewat folder state (cabut perangkat, akhiri sesi); pantau perubahannya.
@@ -179,6 +191,10 @@ pub fn start(cfg: HostConfig) -> Result<Arc<Host>, String> {
     thread::spawn(move || crate::audio::serve(for_audio, audio));
     let for_video = host.clone();
     thread::spawn(move || crate::video::serve(for_video, video));
+    if let Some((target, packets)) = mic_thread {
+        let for_mic = host.clone();
+        thread::spawn(move || crate::mic::serve(for_mic, target, packets));
+    }
 
     let for_rtsp = host.clone();
     thread::spawn(move || crate::rtsp::serve(for_rtsp, rtsp));
@@ -229,6 +245,18 @@ impl Host {
         if self.cfg.verbose {
             let seconds = crate::state::unix_now() % 86_400;
             eprintln!("[host {:02}:{:02}:{:02}Z] {}", seconds / 3600, seconds / 60 % 60, seconds % 60, message());
+        }
+    }
+
+    /// Host ini punya keluaran mikrofon (ditawarkan ke client di DESCRIBE).
+    pub(crate) fn mic_enabled(&self) -> bool {
+        self.mic_tx.is_some()
+    }
+
+    /// Teruskan paket mikrofon ke thread mikrofon; `None` = sesi berakhir. Tidak pernah menunggu.
+    pub(crate) fn send_mic(&self, message: crate::mic::MicMessage) {
+        if let Some(tx) = &self.mic_tx {
+            let _ = tx.lock().unwrap().send(message);
         }
     }
 

@@ -79,6 +79,13 @@ fn event_name(event: &InputEvent) -> &'static str {
     }
 }
 
+/// Yang dihasilkan satu paket kontrol dan harus dikerjakan di luar kunci sesi.
+enum Incoming {
+    Input(InputEvent, Geometry),
+    /// Suara mikrofon pemain: `(nomor urut, paket Opus)`.
+    Mic(u16, Vec<u8>),
+}
+
 /// Jalur input sesi aktif: penerjemah (ingat apa yang sedang ditekan) + penyuntik ke Windows.
 struct InputPath {
     translator: Translator,
@@ -172,6 +179,7 @@ pub(crate) fn serve(host: Arc<Host>, socket: UdpSocket, commands: Receiver<Comma
             enet.peer_mut(peer).disconnect_later(0);
             active = None;
             input.release(&host);
+            host.send_mic(None);
         }
         if let Some(action) = input.translator.repeat(Instant::now()) {
             input.run(&host, &[action]);
@@ -222,11 +230,14 @@ pub(crate) fn serve(host: Arc<Host>, socket: UdpSocket, commands: Receiver<Comma
                 if active == Some(peer) {
                     active = None;
                     input.release(&host);
+                    host.send_mic(None);
                 }
             }
             enet::EventNoRef::Receive { peer, packet, .. } => {
-                if let Some((event, geometry)) = receive(&host, peer.0, packet.data()) {
-                    input.handle(&host, &event, geometry);
+                match receive(&host, peer.0, packet.data()) {
+                    Some(Incoming::Input(event, geometry)) => input.handle(&host, &event, geometry),
+                    Some(Incoming::Mic(sequence, opus)) => host.send_mic(Some((sequence, opus))),
+                    None => {}
                 }
             }
         }
@@ -247,9 +258,9 @@ fn claim(host: &Host, peer: usize, connect_data: u32) -> bool {
     true
 }
 
-/// Proses satu paket kontrol dari peer sesi aktif. Mengembalikan kejadian input bila paket itu input yang sah,
-/// supaya penyuntikannya dilakukan di luar kunci sesi.
-fn receive(host: &Host, peer: usize, packet: &[u8]) -> Option<(InputEvent, Geometry)> {
+/// Proses satu paket kontrol dari peer sesi aktif. Mengembalikan kejadian input atau suara mikrofon bila paket itu
+/// sah, supaya penyuntikan/penerusannya dilakukan di luar kunci sesi.
+fn receive(host: &Host, peer: usize, packet: &[u8]) -> Option<Incoming> {
     let mut stream = host.stream.lock().unwrap();
     let session = stream.as_mut().filter(|s| s.peer == Some(peer))?;
     match open(&session.key, Origin::Client, packet) {
@@ -262,6 +273,11 @@ fn receive(host: &Host, peer: usize, packet: &[u8]) -> Option<(InputEvent, Geome
             if *count == 1 {
                 host.log(|| format!("kanal kontrol: pesan pertama tipe 0x{kind:04x} ({} byte)", payload.len()));
             }
+            if kind == cloudpc_stream_proto::mic::PACKET_TYPE {
+                // Hanya bila host memang menawarkan mikrofon; paket rusak dibuang tanpa mengganggu sesi.
+                let (sequence, opus) = cloudpc_stream_proto::mic::decode(&payload).ok().filter(|_| host.mic_enabled())?;
+                return Some(Incoming::Mic(sequence, opus.to_vec()));
+            }
             if kind != packet_type::INPUT_DATA {
                 return None;
             }
@@ -272,7 +288,7 @@ fn receive(host: &Host, peer: usize, packet: &[u8]) -> Option<(InputEvent, Geome
                 (0, _) | (_, 0) => stream_size,
                 known => known,
             };
-            Some((event, Geometry { desktop, stream: stream_size }))
+            Some(Incoming::Input(event, Geometry { desktop, stream: stream_size }))
         }
         Err(OpenError::NotEncrypted) | Err(OpenError::Malformed) => None,
         Err(OpenError::BadTag) => {

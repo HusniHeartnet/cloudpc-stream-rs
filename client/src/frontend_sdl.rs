@@ -435,6 +435,7 @@ pub fn run<R: Send + 'static>(options: SdlOptions, session: impl FnOnce(SdlSink,
                                     input.apply(&window, true);
                                 }
                                 Shortcut::ToggleStats => show_stats = !show_stats,
+                                Shortcut::ToggleMic => crate::video::note(crate::mic::toggle_notice()),
                             }
                             continue;
                         }

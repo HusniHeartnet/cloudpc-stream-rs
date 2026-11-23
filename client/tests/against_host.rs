@@ -35,6 +35,10 @@ fn rig() -> Rig {
 }
 
 fn rig_with(test_rumble: bool) -> Rig {
+    rig_full(test_rumble, None)
+}
+
+fn rig_full(test_rumble: bool, mic: Option<cloudpc_stream_host::mic::MicTarget>) -> Rig {
     let state = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     let start = 31000 + (std::process::id() % 1500) as u16 * 10;
@@ -54,6 +58,7 @@ fn rig_with(test_rumble: bool) -> Rig {
             test_drop_audio_every: 0,
             test_record_input: true,
             test_rumble,
+            mic: mic.clone(),
         };
         if let Ok(host) = host_http::start(cfg) {
             return Rig { host, addr: HostAddr { host: "127.0.0.1".into(), http_port: base }, state, data };
@@ -303,4 +308,58 @@ fn decoders_work_without_a_window() {
         assert!(gpu > 30 && cpu > 30 && errors == 0, "{codec:?}: {:?}", sink.counts);
         nvhttp::quit(&rig.addr, &store).unwrap();
     }
+}
+
+/// Sesi singkat dengan nada 440 Hz sebagai "mikrofon"; mengembalikan laporan sesi dan pesan yang dilihat host.
+fn stream_with_tone(rig: &Rig, seconds: u64) -> (session::StreamReport, std::collections::BTreeMap<u16, u32>) {
+    assert_eq!(pair(rig, "7310", "7310").unwrap(), "PC Uji");
+    let store = Store::open(rig.data.path()).unwrap();
+    let options = StreamOptions { app: "Desktop".into(), width: 1280, height: 720, fps: 60, bitrate_kbps: 5_000, codec: CodecChoice::Auto, ..Default::default() };
+    let mut microphone = cloudpc_stream_client::mic::Microphone::test_tone().unwrap();
+    let started = Instant::now();
+    let mut seen = None;
+    let stop = || {
+        if started.elapsed() > Duration::from_secs(seconds) - Duration::from_millis(300) {
+            seen = rig.host.stream_snapshot().map(|s| s.messages).or(seen.take());
+        }
+        started.elapsed() > Duration::from_secs(seconds)
+    };
+    let outputs = session::Outputs { mic: Some(&mut microphone), ..Default::default() };
+    let report = session::run_with(&rig.addr, &store, &options, outputs, stop, |_| {}).unwrap();
+    (report, seen.expect("host punya sesi stream yang aktif"))
+}
+
+#[test]
+fn microphone_tone_reaches_the_host_output_intact() {
+    use cloudpc_stream_common::voice::tone_purity;
+    let _turn = streaming();
+    let out = tempfile::tempdir().unwrap();
+    let wav = out.path().join("mic.wav");
+    let rig = rig_full(false, Some(cloudpc_stream_host::mic::MicTarget::Wav(wav.clone())));
+    let (report, seen) = stream_with_tone(&rig, 4);
+    assert!(!report.mic_refused, "host dengan keluaran mikrofon menawarkannya di DESCRIBE");
+    assert!(report.mic_packets > 100, "20 ms per paket selama ±4 dtk: {}", report.mic_packets);
+    let at_host = u64::from(seen.get(&cloudpc_stream_proto::mic::PACKET_TYPE).copied().unwrap_or(0));
+    assert!(at_host + 30 >= report.mic_packets, "paket mikrofon tiba di host: {at_host} dari {}", report.mic_packets);
+
+    // Thread mikrofon host menulis tiap paket begitu tiba; beri waktu sebentar untuk yang terakhir.
+    thread::sleep(Duration::from_millis(300));
+    let bytes = std::fs::read(&wav).unwrap();
+    assert_eq!(&bytes[..4], b"RIFF");
+    let pcm: Vec<i16> = bytes[44..].chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+    let frames = pcm.len() / 960;
+    assert!(frames as u64 + 30 >= report.mic_packets && frames as u64 <= report.mic_packets + 5, "suara di host {frames} frame, dikirim {}", report.mic_packets);
+    // Lewati awal (encoder baru mulai); sisanya harus nada 440 Hz yang bersih, bukan suara rusak.
+    let purity = tone_purity(&pcm[960 * 10..], 440.0);
+    assert!(purity > 0.9, "kemurnian nada di host {purity}");
+}
+
+#[test]
+fn hosts_without_a_microphone_output_are_never_sent_microphone_packets() {
+    let _turn = streaming();
+    let rig = rig();
+    let (report, seen) = stream_with_tone(&rig, 3);
+    assert!(report.mic_refused);
+    assert_eq!(report.mic_packets, 0);
+    assert!(!seen.contains_key(&cloudpc_stream_proto::mic::PACKET_TYPE), "host tanpa mikrofon tidak boleh menerima pesan mikrofon: {seen:x?}");
 }

@@ -47,6 +47,8 @@ pub struct HostOffer {
     pub ref_invalidation: bool,
     pub hevc: bool,
     pub av1: bool,
+    /// Host punya keluaran mikrofon (ekstensi CloudPC); Sunshine asli tidak pernah menyatakannya.
+    pub mic: bool,
 }
 
 /// Hasil jabat tangan: port aliran dan data yang dibawa client ke sana.
@@ -142,6 +144,7 @@ fn parse_offer(sdp: &[u8]) -> HostOffer {
         ref_invalidation: attrs.contains_key("x-nv-video[0].refPicInvalidation"),
         hevc: text.contains("sprop-parameter-sets=AAAAAU"),
         av1: text.contains("AV1/90000"),
+        mic: attrs.contains_key(cloudpc_stream_proto::mic::SDP_ATTRIBUTE),
     }
 }
 
@@ -300,7 +303,8 @@ mod tests {
     #[test]
     fn host_offer_from_describe() {
         let sunshine = b"a=x-ss-general.featureFlags:3\na=x-ss-general.encryptionSupported:7\na=x-ss-general.encryptionRequested:1\na=x-nv-video[0].refPicInvalidation:1\nsprop-parameter-sets=AAAAAU\na=rtpmap:98 AV1/90000\n";
-        assert_eq!(parse_offer(sunshine), HostOffer { encryption_supported: 7, encryption_requested: 1, ref_invalidation: true, hevc: true, av1: true });
+        assert_eq!(parse_offer(sunshine), HostOffer { encryption_supported: 7, encryption_requested: 1, ref_invalidation: true, hevc: true, av1: true, mic: false });
+        assert!(parse_offer(b"a=x-ss-general.encryptionSupported:7\na=x-cloudpc-mic:1\n").mic, "host CloudPC dengan keluaran mikrofon");
         assert_eq!(parse_offer(b"a=x-ss-general.encryptionSupported:5\n"), HostOffer { encryption_supported: 5, ..Default::default() });
     }
 }
