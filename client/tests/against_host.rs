@@ -39,6 +39,11 @@ fn rig_with(test_rumble: bool) -> Rig {
 }
 
 fn rig_full(test_rumble: bool, mic: Option<cloudpc_stream_host::mic::MicTarget>) -> Rig {
+    rig_custom(test_rumble, mic, (0, 1))
+}
+
+/// `drop_video`: (tiap berapa paket, berapa paket berturut-turut) yang dibuang host; (0, 1) = tidak ada.
+fn rig_custom(test_rumble: bool, mic: Option<cloudpc_stream_host::mic::MicTarget>, drop_video: (u32, u32)) -> Rig {
     let state = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     let start = 31000 + (std::process::id() % 1500) as u16 * 10;
@@ -52,8 +57,8 @@ fn rig_full(test_rumble: bool, mic: Option<cloudpc_stream_host::mic::MicTarget>)
             uniqueid: None,
             pin_wait: Duration::from_secs(10),
             verbose: false,
-            test_drop_video_every: 0,
-            test_drop_video_burst: 1,
+            test_drop_video_every: drop_video.0,
+            test_drop_video_burst: drop_video.1,
             test_silent_audio: true,
             test_drop_audio_every: 0,
             test_record_input: true,
@@ -192,6 +197,66 @@ fn frames_are_decoded_and_shown_in_a_window() {
         assert!(shown.presented > 60, "{codec:?}: gambar tampil terus: {shown:?}, {report:?}");
         assert!(shown.receive_to_present_ms < 16.0, "{codec:?}: tanpa antrean di client: {shown:?}");
         nvhttp::quit(&rig.addr, &store).unwrap();
+    }
+}
+
+/// Penampil tiruan tanpa jendela: mencatat nomor dan jenis tiap frame yang diberikan ke decoder, dan menyatakan codec
+/// mana yang "didecode hardware".
+struct TypeSink {
+    hardware: Vec<cloudpc_stream_client::rtsp::Codec>,
+    frames: Vec<(u32, cloudpc_stream_proto::video::FrameType)>,
+}
+
+impl session::VideoSink for TypeSink {
+    fn start(&mut self, _: cloudpc_stream_client::rtsp::Codec) {}
+    fn frame(&mut self, frame: cloudpc_stream_client::video::depacketize::VideoFrame) {
+        self.frames.push((frame.index, frame.frame_type));
+    }
+    fn take_idr_request(&mut self) -> bool {
+        false
+    }
+    fn closed(&self) -> bool {
+        false
+    }
+    fn hardware_codecs(&self) -> Option<Vec<cloudpc_stream_client::rtsp::Codec>> {
+        Some(self.hardware.clone())
+    }
+}
+
+/// Sesi #117 (24 Nov 2026): H.264 di decoder GPU AMD menampilkan gambar lama berulang-ulang setelah frame hilang
+/// dipulihkan dengan invalidasi frame rujukan. Sekarang H.264 pada decoder hardware meminta satu frame rujukan: tiap
+/// celah di aliran yang sampai ke decoder harus dilanjutkan oleh IDR, tidak pernah oleh P-frame jenis 5. H.264 di CPU
+/// (decoder perangkat lunak) tetap memakai invalidasi. Host membuang paket berkelompok; tanpa jendela.
+#[test]
+fn h264_on_a_hardware_decoder_recovers_lost_frames_with_idr() {
+    use cloudpc_stream_client::rtsp::Codec;
+    use cloudpc_stream_proto::video::FrameType;
+    let _turn = streaming();
+    let rig = rig_custom(false, None, (120, 4));
+    pair(&rig, "4821", "4821").unwrap();
+    let store = Store::open(rig.data.path()).unwrap();
+    // Setelan sesi #117: 720p 30 FPS 1 Mbps H.264.
+    let options = StreamOptions { app: "Desktop".into(), width: 1280, height: 720, fps: 30, bitrate_kbps: 1_000, codec: CodecChoice::Only(Codec::H264), dump_video: None, ..Default::default() };
+    for hardware in [vec![Codec::H264, Codec::Hevc], Vec::new()] {
+        let on_gpu = !hardware.is_empty();
+        let mut sink = TypeSink { hardware, frames: Vec::new() };
+        let started = Instant::now();
+        let outputs = session::Outputs { video: Some(&mut sink), ..Default::default() };
+        let report = session::run_with(&rig.addr, &store, &options, outputs, || started.elapsed() > Duration::from_secs(8), |_| {}).unwrap();
+        nvhttp::quit(&rig.addr, &store).unwrap();
+        assert!(report.video.frames_lost >= 1, "host uji harus sempat menghilangkan frame: {report:?}");
+        assert_eq!(sink.frames.first().map(|f| f.1), Some(FrameType::Idr), "aliran dimulai dari IDR");
+        // Frame pertama setelah tiap celah nomor frame.
+        let resumes: Vec<FrameType> = sink.frames.windows(2).filter(|w| w[1].0 != w[0].0 + 1).map(|w| w[1].1).collect();
+        assert!(!resumes.is_empty(), "ada celah yang dipulihkan: {report:?}");
+        if on_gpu {
+            assert_eq!((report.invalidations_sent, report.idr_requests_sent >= 1), (0, true), "decoder GPU: minta IDR, bukan invalidasi: {report:?}");
+            assert!(resumes.iter().all(|t| *t == FrameType::Idr), "decoder GPU: tiap celah dilanjutkan IDR: {resumes:?}");
+            assert!(sink.frames.iter().all(|f| f.1 != FrameType::AfterRefInvalidation), "decoder GPU tidak pernah menerima P-frame hasil invalidasi");
+        } else {
+            assert!(report.invalidations_sent >= 1, "decoder perangkat lunak tetap memakai invalidasi: {report:?}");
+            assert!(resumes.contains(&FrameType::AfterRefInvalidation), "decoder perangkat lunak: celah dilanjutkan P-frame jenis 5: {resumes:?}");
+        }
     }
 }
 

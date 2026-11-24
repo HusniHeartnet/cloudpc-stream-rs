@@ -231,6 +231,18 @@ pub fn packet_size_for(ip: IpAddr) -> u32 {
     }
 }
 
+/// H.264 pada decoder hardware: minta host memakai satu frame rujukan, sehingga frame yang hilang dijawab IDR dan
+/// bukan invalidasi frame rujukan (P-frame yang merujuk gambar lebih lama). Sama dengan Moonlight, yang hanya memakai
+/// invalidasi H.264 pada decoder yang menyatakan sanggup (`CAPABILITY_REFERENCE_FRAME_INVALIDATION_AVC`): setelah
+/// invalidasi decoder menerima aliran dengan nomor frame yang melompat, dan decoder GPU tertentu lalu menampilkan
+/// gambar lama berulang-ulang atau gelap sampai IDR berikutnya (sesi #117, 24 Nov 2026, grafis terpadu AMD Radeon 660M;
+/// pada NVIDIA dan decoder perangkat lunak hasilnya benar, tetapi client tidak memilah merek GPU). HEVC dan AV1 membawa
+/// daftar frame rujukan di tiap frame, jadi tetap memakai invalidasi. `hardware`: codec yang didecode hardware oleh
+/// penampil; `None` = tanpa penampil (rekam saja).
+pub fn needs_single_reference(codec: Codec, hardware: Option<&[Codec]>) -> bool {
+    codec == Codec::H264 && hardware.is_some_and(|codecs| codecs.contains(&Codec::H264))
+}
+
 /// Codec akhir dari pilihan pengguna dan yang dinyatakan host (`ServerCodecModeSupport` + DESCRIBE).
 pub fn pick_codec(choice: CodecChoice, server_codecs: u32, offer: &rtsp::HostOffer, client: Option<&[Codec]>) -> Result<Codec, String> {
     let hevc = server_codecs & server_codec_mode::HEVC != 0 || offer.hevc;
@@ -299,9 +311,19 @@ pub fn run_with(
     let client_codecs = sink.as_deref().and_then(|s| s.hardware_codecs());
     let (params, negotiated) = rtsp::handshake(&addr.host, &launched.session_url, launched.key, |offer| {
         let codec = pick_codec(options.codec, info.codecs, offer, client_codecs.as_deref())?;
-        Ok(StreamParams { width: options.width, height: options.height, fps: options.fps, bitrate_kbps: options.bitrate_kbps, codec, packet_size })
+        let single_reference = needs_single_reference(codec, client_codecs.as_deref());
+        Ok(StreamParams { width: options.width, height: options.height, fps: options.fps, bitrate_kbps: options.bitrate_kbps, codec, packet_size, single_reference })
     })?;
-    progress(format!("RTSP selesai: {:?} {}x{}@{} {} kbps, enkripsi {}", params.codec, params.width, params.height, params.fps, params.bitrate_kbps, negotiated.encryption));
+    progress(format!(
+        "RTSP selesai: {:?} {}x{}@{} {} kbps, enkripsi {}, frame hilang dipulihkan dengan {}",
+        params.codec,
+        params.width,
+        params.height,
+        params.fps,
+        params.bitrate_kbps,
+        negotiated.encryption,
+        if negotiated.offer.ref_invalidation && !params.single_reference { "invalidasi frame rujukan" } else { "IDR" }
+    ));
 
     let video_target = SocketAddr::new(ip, negotiated.video_port);
     let audio_target = SocketAddr::new(ip, negotiated.audio_port);
@@ -330,7 +352,8 @@ pub fn run_with(
     let mut loss = VideoLoss::default();
     let video_encrypted = negotiated.encryption & encryption::VIDEO != 0;
     let mut depacketizer = Depacketizer::new(packet_size, video_encrypted.then_some(launched.key));
-    let mut recovery = Recovery::new(negotiated.offer.ref_invalidation);
+    // Satu frame rujukan = host tidak bisa menginvalidasi; langsung minta IDR, jangan menunggu jawaban yang tidak datang.
+    let mut recovery = Recovery::new(negotiated.offer.ref_invalidation && !params.single_reference);
     let mut dump = match &options.dump_video {
         Some(path) => Some(std::io::BufWriter::new(std::fs::File::create(path).map_err(|e| format!("file {}: {e}", path.display()))?)),
         None => None,
@@ -554,7 +577,7 @@ mod tests {
 
     #[test]
     fn status_warns_only_after_sustained_loss() {
-        let params = StreamParams { width: 1920, height: 1080, fps: 60, bitrate_kbps: 20_000, codec: Codec::Hevc, packet_size: 1392 };
+        let params = StreamParams { width: 1920, height: 1080, fps: 60, bitrate_kbps: 20_000, codec: Codec::Hevc, packet_size: 1392, single_reference: false };
         let mut window = StatusWindow::default();
         let mut sample = StatusSample { rtt: (20, 2), ..Default::default() };
         let mut warnings = Vec::new();
@@ -570,6 +593,20 @@ mod tests {
         }
         // Kehilangan terakhir di detik 5; jendela 3 detik bersih lagi di detik 8.
         assert_eq!(warnings, [false, false, false, true, true, true, true, true, false], "peringatan menyala selama kehilangan, padam 3 detik kemudian");
+    }
+
+    #[test]
+    fn h264_on_a_hardware_decoder_asks_for_one_reference_frame() {
+        let all = [Codec::H264, Codec::Hevc, Codec::Av1];
+        // H.264 yang didecode GPU: satu frame rujukan (frame hilang dijawab IDR), seperti Moonlight.
+        assert!(needs_single_reference(Codec::H264, Some(&all)));
+        // HEVC dan AV1 tetap memakai invalidasi frame rujukan.
+        assert!(!needs_single_reference(Codec::Hevc, Some(&all)));
+        assert!(!needs_single_reference(Codec::Av1, Some(&all)));
+        // H.264 di CPU (GPU tanpa decoder H.264, atau `--video-decoder software`) dan tanpa penampil: tidak dibatasi.
+        assert!(!needs_single_reference(Codec::H264, Some(&[Codec::Hevc])));
+        assert!(!needs_single_reference(Codec::H264, Some(&[])));
+        assert!(!needs_single_reference(Codec::H264, None));
     }
 
     #[test]

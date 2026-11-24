@@ -37,6 +37,10 @@ pub struct StreamParams {
     pub codec: Codec,
     /// Ukuran payload paket video: 1392 di LAN, 1024 lewat internet (aman untuk MTU terowongan).
     pub packet_size: u32,
+    /// Minta host memakai SATU frame rujukan (`maxNumReferenceFrames:1`): frame yang hilang lalu dijawab IDR, bukan
+    /// invalidasi frame rujukan. Dipakai untuk H.264 pada decoder hardware, sama dengan Moonlight tanpa
+    /// `CAPABILITY_REFERENCE_FRAME_INVALIDATION_AVC`; lihat `session::needs_single_reference`.
+    pub single_reference: bool,
 }
 
 /// Yang dinyatakan host di DESCRIBE.
@@ -115,7 +119,7 @@ pub fn build_sdp(params: &StreamParams, encryption: u32, host: &str) -> String {
         ("x-nv-vqos[0].bitStreamFormat", codec),
         ("x-nv-clientSupportHevc", if params.codec == Codec::Hevc { "1" } else { "0" }.into()),
         ("x-nv-video[0].dynamicRangeMode", "0".into()),
-        ("x-nv-video[0].maxNumReferenceFrames", "0".into()),
+        ("x-nv-video[0].maxNumReferenceFrames", if params.single_reference { "1" } else { "0" }.into()),
         ("x-nv-video[0].clientRefreshRateX100", (params.fps * 100).to_string()),
         ("x-nv-audio.surround.numChannels", "2".into()),
         ("x-nv-audio.surround.channelMask", "3".into()),
@@ -261,7 +265,7 @@ mod tests {
 
     #[test]
     fn sdp_carries_everything_the_host_requires() {
-        let params = StreamParams { width: 1920, height: 1080, fps: 120, bitrate_kbps: 30000, codec: Codec::Hevc, packet_size: 1024 };
+        let params = StreamParams { width: 1920, height: 1080, fps: 120, bitrate_kbps: 30000, codec: Codec::Hevc, packet_size: 1024, single_reference: false };
         let sdp = build_sdp(&params, 7, "203.0.113.10");
         assert!(sdp.starts_with("v=0\r\no=android 0 14 IN IPv4 203.0.113.10\r\ns=NVIDIA Streaming Client\r\n"));
         assert!(sdp.ends_with("t=0 0\r\nm=video 47998  \r\n"));
@@ -298,6 +302,10 @@ mod tests {
         }
         assert_eq!((attrs["x-nv-video[0].maxFPS"].as_str(), attrs["x-nv-vqos[0].bitStreamFormat"].as_str(), attrs["x-ss-general.encryptionEnabled"].as_str()), ("120", "1", "7"));
         assert!(build_sdp(&params, 7, "fe80::1").contains("IN IPv6 fe80::1"));
+        // Bawaan: host bebas memakai beberapa frame rujukan (invalidasi). H.264 pada decoder hardware meminta satu saja.
+        assert_eq!(attrs["x-nv-video[0].maxNumReferenceFrames"].as_str(), "0");
+        let single = StreamParams { codec: Codec::H264, single_reference: true, ..params };
+        assert_eq!(sdp_map(&build_sdp(&single, 7, "203.0.113.10"))["x-nv-video[0].maxNumReferenceFrames"].as_str(), "1");
     }
 
     #[test]
