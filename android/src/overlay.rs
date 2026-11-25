@@ -14,6 +14,10 @@
 //! - Mode atur: geser kontrol untuk memindahkan, lalu perbesar/perkecil/sembunyikan yang terpilih, atau kembali ke bawaan.
 //!   Disimpan sebagai JSON di HP pemain; yang disimpan hanya penyimpangan dari bawaan per id kontrol, jadi kontrol baru di
 //!   versi aplikasi berikutnya tetap muncul.
+//! - Tombol buatan pemain (25 Nov 2026): di mode atur pemain bisa MENAMBAH tombol sendiri (tombol keyboard, tombol mouse,
+//!   atau roda mouse; ditahan, hidup/mati, atau ditahan sambil mengarahkan), memberi tulisan sendiri, mengubah tombol
+//!   bundar bawaan ke tombol lain, dan menghapus tombol buatannya. Semuanya per profil dan tersimpan di file yang sama
+//!   (id tombol buatan = `u<angka>`). "Bawaan" mengembalikan profil ke bawaan dan membuang tombol buatan di profil itu.
 //!
 //! Murni data, tanpa Android: sisi Kotlin hanya menggambar daftar dari `describe` dan meneruskan sentuhan.
 
@@ -39,6 +43,10 @@ const DPAD_DEAD: f32 = 0.22;
 const KEY_STICK_DEAD: f32 = 0.30;
 /// Stik gerak keyboard didorong sejauh ini ke depan = tombol lari ikut ditahan.
 const SPRINT_AT: f32 = 0.95;
+/// Tombol buatan pemain: jumlah terbanyak per profil, panjang tulisan, dan ukuran saat baru dibuat.
+const CUSTOM_LIMIT: usize = 40;
+const LABEL_LIMIT: usize = 12;
+const CUSTOM_SIZE: f32 = 0.12;
 
 /// Kode tombol virtual Windows yang dipakai tata letak bawaan.
 mod vk {
@@ -129,8 +137,9 @@ pub enum Kind {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Control {
-    pub id: &'static str,
-    pub label: &'static str,
+    /// Id tetap untuk kontrol bawaan; `u<angka>` untuk tombol buatan pemain.
+    pub id: String,
+    pub label: String,
     pub kind: Kind,
     pub side: Side,
     /// Jarak pusat dari tepi `side`, satuan tinggi layar.
@@ -163,6 +172,157 @@ struct SavedControl {
     y: f32,
     size: f32,
     visible: bool,
+    /// Hanya untuk tombol buatan pemain dan tombol bawaan yang diubah pemain: tulisan, kode aksi (`action_choices`), dan
+    /// cara kerjanya. Kosong = bawaan aplikasi (jadi perubahan bawaan di versi berikutnya tetap sampai ke pemain).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    action: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mode: Option<Mode>,
+}
+
+/// Cara kerja tombol buatan pemain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    /// Ditekan selama jari menempel.
+    Hold,
+    /// Ketuk sekali = ditekan terus, ketuk lagi = dilepas.
+    Toggle,
+    /// Ditekan selama jari menempel, dan geseran jari ikut menggerakkan mouse (mengarahkan kamera/skill).
+    Aim,
+}
+
+impl Mode {
+    pub fn from_code(code: i32) -> Mode {
+        match code {
+            1 => Mode::Toggle,
+            2 => Mode::Aim,
+            _ => Mode::Hold,
+        }
+    }
+
+    pub fn code(self) -> i32 {
+        self as i32
+    }
+}
+
+/// Pilihan untuk tombol buatan pemain: (kode aksi, nama di daftar pilihan, tulisan bawaan di tombol). Kode aksi:
+/// `k<kode tombol virtual Windows>`, `m<tombol mouse 1..5>`, `w<putaran roda>`.
+pub fn action_choices() -> Vec<(String, String, String)> {
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    let mut key = |vk: u16, name: &str, label: &str| out.push((format!("k{vk}"), name.to_string(), label.to_string()));
+    for letter in b'A'..=b'Z' {
+        let text = (letter as char).to_string();
+        key(u16::from(letter), &text, &text);
+    }
+    for digit in b'0'..=b'9' {
+        let text = (digit as char).to_string();
+        key(u16::from(digit), &text, &text);
+    }
+    for (vk, name, label) in [
+        (0x20, "Spasi", "Spasi"),
+        (0x0D, "Enter", "Enter"),
+        (0x1B, "Esc", "Esc"),
+        (0x09, "Tab", "Tab"),
+        (0xA0, "Shift", "Shift"),
+        (0xA2, "Ctrl", "Ctrl"),
+        (0xA4, "Alt", "Alt"),
+        (0x08, "Backspace", "Hapus"),
+        (0x14, "Caps Lock", "Caps"),
+        (0x26, "Panah atas", "Atas"),
+        (0x28, "Panah bawah", "Bawah"),
+        (0x25, "Panah kiri", "Kiri"),
+        (0x27, "Panah kanan", "Kanan"),
+        (0x2D, "Insert", "Ins"),
+        (0x2E, "Delete", "Del"),
+        (0x24, "Home", "Home"),
+        (0x23, "End", "End"),
+        (0x21, "Page Up", "PgUp"),
+        (0x22, "Page Down", "PgDn"),
+        (0xC0, "` (backtick)", "`"),
+        (0xBD, "- (minus)", "-"),
+        (0xBB, "= (sama dengan)", "="),
+        (0xDB, "[", "["),
+        (0xDD, "]", "]"),
+        (0xDC, "\\ (garis miring terbalik)", "\\"),
+        (0xBA, "; (titik koma)", ";"),
+        (0xDE, "' (petik)", "'"),
+        (0xBC, ", (koma)", ","),
+        (0xBE, ". (titik)", "."),
+        (0xBF, "/ (garis miring)", "/"),
+    ] {
+        key(vk, name, label);
+    }
+    for f in 1..=12u16 {
+        let text = format!("F{f}");
+        key(0x6F + f, &text, &text);
+    }
+    for (code, name, label) in [
+        ("m1", "Mouse: klik kiri", "Klik"),
+        ("m3", "Mouse: klik kanan", "Kanan"),
+        ("m2", "Mouse: klik tengah", "Tengah"),
+        ("m4", "Mouse: tombol samping 1", "M4"),
+        ("m5", "Mouse: tombol samping 2", "M5"),
+        ("w120", "Mouse: roda ke atas", "Roda+"),
+        ("w-120", "Mouse: roda ke bawah", "Roda-"),
+    ] {
+        out.push((code.to_string(), name.to_string(), label.to_string()));
+    }
+    out
+}
+
+/// Jenis kontrol untuk kode aksi + cara kerja; `None` = kode tidak dikenal.
+fn kind_for(action: &str, mode: Mode) -> Option<Kind> {
+    let (prefix, number) = action.split_at(action.chars().next()?.len_utf8());
+    match prefix {
+        "k" => {
+            let vk = number.parse::<u16>().ok().filter(|vk| (1..=0xFE).contains(vk))?;
+            Some(match mode {
+                Mode::Hold => Kind::Key(vk),
+                Mode::Toggle => Kind::KeyToggle(vk),
+                Mode::Aim => Kind::KeyAim(vk),
+            })
+        }
+        "m" => {
+            let button = number.parse::<u8>().ok().filter(|b| (1..=5).contains(b))?;
+            // Tombol mouse yang ditahan selalu ikut memutar kamera, jadi "tahan" dan "arahkan" sama.
+            Some(if mode == Mode::Toggle { Kind::MouseToggle(button) } else { Kind::Mouse(button) })
+        }
+        "w" => number.parse::<i16>().ok().filter(|n| matches!(n, 120 | -120)).map(Kind::Wheel),
+        _ => None,
+    }
+}
+
+/// Kebalikan `kind_for`: kode aksi dan cara kerja sebuah kontrol; `None` = bukan tombol yang bisa diubah pemain (stik,
+/// d-pad, tombol gamepad, tombol toko).
+fn action_of(kind: Kind) -> Option<(String, Mode)> {
+    Some(match kind {
+        Kind::Key(vk) => (format!("k{vk}"), Mode::Hold),
+        Kind::KeyToggle(vk) => (format!("k{vk}"), Mode::Toggle),
+        Kind::KeyAim(vk) => (format!("k{vk}"), Mode::Aim),
+        Kind::Mouse(button) => (format!("m{button}"), Mode::Hold),
+        Kind::MouseToggle(button) => (format!("m{button}"), Mode::Toggle),
+        Kind::Wheel(amount) => (format!("w{amount}"), Mode::Hold),
+        _ => return None,
+    })
+}
+
+/// Id tombol buatan pemain: `u` diikuti angka (tidak ada id bawaan berbentuk itu).
+fn is_custom(id: &str) -> bool {
+    id.strip_prefix('u').is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Tulisan tombol dari pemain: tanpa pemisah daftar gambar (`|`) dan baris baru, dipangkas, paling panjang
+/// `LABEL_LIMIT` huruf. Kosong = tulisan bawaan aksi itu.
+fn clean_label(label: &str, action: &str) -> String {
+    let text: String = label.chars().map(|c| if c == '|' || c.is_control() { ' ' } else { c }).collect();
+    let text: String = text.trim().chars().take(LABEL_LIMIT).collect();
+    if !text.trim().is_empty() {
+        return text.trim().to_string();
+    }
+    action_choices().into_iter().find(|(code, _, _)| code == action).map(|(_, _, label)| label).unwrap_or_else(|| "?".into())
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -186,7 +346,7 @@ struct Saved {
 
 /// Tata letak bawaan CloudPC untuk satu profil (posisi mendatar; lihat catatan modul untuk satuannya).
 pub fn default_controls(profile: Profile) -> Vec<Control> {
-    let c = |id, label, kind, side, x, y, size| Control { id, label, kind, side, x, y, size, visible: true };
+    let c = |id: &str, label: &str, kind, side, x, y, size| Control { id: id.to_string(), label: label.to_string(), kind, side, x, y, size, visible: true };
     match profile {
         Profile::Gamepad => vec![
             c("ls", "L", Kind::LeftStick, Side::Left, 0.24, 0.70, 0.36),
@@ -270,6 +430,8 @@ pub enum EditAction {
     Smaller = 2,
     ToggleVisible = 3,
     Reset = 4,
+    /// Hapus tombol buatan pemain yang terpilih (kontrol bawaan hanya disembunyikan).
+    Delete = 5,
 }
 
 impl EditAction {
@@ -279,6 +441,7 @@ impl EditAction {
             2 => EditAction::Smaller,
             3 => EditAction::ToggleVisible,
             4 => EditAction::Reset,
+            5 => EditAction::Delete,
             _ => return None,
         })
     }
@@ -359,22 +522,61 @@ impl Default for Overlay {
     }
 }
 
-fn apply_saved(controls: &mut [Control], saved: Vec<SavedControl>) {
+fn apply_saved(controls: &mut Vec<Control>, saved: Vec<SavedControl>) {
     for s in saved {
-        if let Some(c) = controls.iter_mut().find(|c| c.id == s.id) {
-            if [s.x, s.y, s.size].iter().all(|v| v.is_finite()) {
-                c.side = s.side;
-                c.x = s.x.clamp(0.0, 4.0);
-                c.y = s.y.clamp(0.0, 1.0);
-                c.size = s.size.clamp(SIZE_RANGE.0, SIZE_RANGE.1);
-                c.visible = s.visible;
-            }
+        if ![s.x, s.y, s.size].iter().all(|v| v.is_finite()) {
+            continue;
         }
+        // Aksi dari pemain: untuk tombol buatan (wajib) atau tombol bawaan yang ia ubah.
+        let chosen = s.action.as_deref().and_then(|action| Some((action, kind_for(action, s.mode.unwrap_or(Mode::Hold))?)));
+        let index = match controls.iter().position(|c| c.id == s.id) {
+            Some(index) => {
+                if let Some((action, kind)) = chosen.filter(|_| action_of(controls[index].kind).is_some()) {
+                    controls[index].kind = kind;
+                    controls[index].label = clean_label(s.label.as_deref().unwrap_or(""), action);
+                }
+                index
+            }
+            None => {
+                let Some((action, kind)) = chosen.filter(|_| is_custom(&s.id)) else { continue };
+                if controls.iter().filter(|c| is_custom(&c.id)).count() >= CUSTOM_LIMIT {
+                    continue;
+                }
+                let label = clean_label(s.label.as_deref().unwrap_or(""), action);
+                controls.push(Control { id: s.id.clone(), label, kind, side: s.side, x: 0.0, y: 0.0, size: CUSTOM_SIZE, visible: true });
+                controls.len() - 1
+            }
+        };
+        let c = &mut controls[index];
+        c.side = s.side;
+        c.x = s.x.clamp(0.0, 4.0);
+        c.y = s.y.clamp(0.0, 1.0);
+        c.size = s.size.clamp(SIZE_RANGE.0, SIZE_RANGE.1);
+        c.visible = s.visible;
     }
 }
 
-fn to_saved(controls: &[Control]) -> Vec<SavedControl> {
-    controls.iter().map(|c| SavedControl { id: c.id.to_string(), side: c.side, x: c.x, y: c.y, size: c.size, visible: c.visible }).collect()
+fn to_saved(profile: Profile, controls: &[Control]) -> Vec<SavedControl> {
+    let defaults = default_controls(profile);
+    controls
+        .iter()
+        .map(|c| {
+            // Aksi dan tulisan hanya ditulis bila berbeda dari bawaan (tombol buatan selalu berbeda: tidak ada bawaannya).
+            let unchanged = defaults.iter().any(|d| d.id == c.id && d.kind == c.kind && d.label == c.label);
+            let chosen = if unchanged { None } else { action_of(c.kind) };
+            SavedControl {
+                id: c.id.clone(),
+                side: c.side,
+                x: c.x,
+                y: c.y,
+                size: c.size,
+                visible: c.visible,
+                label: chosen.as_ref().map(|_| c.label.clone()),
+                mode: chosen.as_ref().map(|(_, mode)| *mode),
+                action: chosen.map(|(action, _)| action),
+            }
+        })
+        .collect()
 }
 
 impl Overlay {
@@ -400,9 +602,9 @@ impl Overlay {
             version: VERSION,
             shown: self.shown,
             profile: self.profile,
-            gamepad: to_saved(&self.layouts[Profile::Gamepad.index()]),
-            minecraft: to_saved(&self.layouts[Profile::Minecraft.index()]),
-            deadlock: to_saved(&self.layouts[Profile::Deadlock.index()]),
+            gamepad: to_saved(Profile::Gamepad, &self.layouts[Profile::Gamepad.index()]),
+            minecraft: to_saved(Profile::Minecraft, &self.layouts[Profile::Minecraft.index()]),
+            deadlock: to_saved(Profile::Deadlock, &self.layouts[Profile::Deadlock.index()]),
             gyro: self.gyro,
             gyro_invert: self.gyro_invert,
         };
@@ -849,13 +1051,60 @@ impl Overlay {
             self.drag = None;
             return;
         }
-        let Some(control) = self.selected.and_then(|i| self.layouts[profile.index()].get_mut(i)) else { return };
+        let Some(index) = self.selected.filter(|i| *i < self.layouts[profile.index()].len()) else { return };
+        if action == EditAction::Delete && is_custom(&self.layouts[profile.index()][index].id) {
+            // Indeks kontrol sesudahnya bergeser: tidak boleh ada yang masih merujuk indeks lama.
+            self.release_all();
+            self.layouts[profile.index()].remove(index);
+            self.selected = None;
+            self.drag = None;
+            return;
+        }
+        let control = &mut self.layouts[profile.index()][index];
         match action {
             EditAction::Bigger => control.size = (control.size * SIZE_STEP).min(SIZE_RANGE.1),
             EditAction::Smaller => control.size = (control.size / SIZE_STEP).max(SIZE_RANGE.0),
             EditAction::ToggleVisible => control.visible = !control.visible,
+            EditAction::Delete => control.visible = false, // kontrol bawaan tidak dihapus, hanya disembunyikan
             EditAction::Reset => {}
         }
+    }
+
+    /// Tambah tombol buatan pemain ke profil yang sedang dipakai: muncul di tengah layar dan langsung terpilih (pemain
+    /// lalu menggesernya). `false` = kode aksi tidak dikenal atau tombol buatan sudah terlalu banyak.
+    pub fn add_button(&mut self, label: &str, action: &str, mode: Mode) -> bool {
+        let Some(kind) = kind_for(action, mode) else { return false };
+        let profile = self.profile.index();
+        if self.layouts[profile].iter().filter(|c| is_custom(&c.id)).count() >= CUSTOM_LIMIT {
+            return false;
+        }
+        let next = self.layouts[profile].iter().filter_map(|c| c.id.strip_prefix('u')?.parse::<u32>().ok()).max().map_or(1, |n| n + 1);
+        let (w, h) = self.view;
+        let x = if h > 0.0 { w / 2.0 / h } else { 1.0 };
+        self.layouts[profile].push(Control { id: format!("u{next}"), label: clean_label(label, action), kind, side: Side::Left, x, y: 0.5, size: CUSTOM_SIZE, visible: true });
+        self.selected = Some(self.layouts[profile].len() - 1);
+        self.drag = None;
+        true
+    }
+
+    /// Ganti aksi, cara kerja, dan tulisan kontrol terpilih. Hanya untuk tombol (bukan stik, d-pad, tombol gamepad).
+    pub fn change_selected(&mut self, label: &str, action: &str, mode: Mode) -> bool {
+        let profile = self.profile.index();
+        let Some(index) = self.selected.filter(|i| *i < self.layouts[profile].len()) else { return false };
+        let Some(kind) = kind_for(action, mode).filter(|_| action_of(self.layouts[profile][index].kind).is_some()) else { return false };
+        self.release_all();
+        let control = &mut self.layouts[profile][index];
+        control.kind = kind;
+        control.label = clean_label(label, action);
+        true
+    }
+
+    /// Kontrol terpilih di mode atur, untuk dialog "Ubah": `id|tulisan|kode aksi|cara kerja|buatan pemain|bisa diubah`
+    /// (dua yang terakhir 0/1; kode aksi kosong bila tidak bisa diubah). Kosong = belum ada yang terpilih.
+    pub fn selected_info(&self) -> String {
+        let Some(c) = self.selected.and_then(|i| self.controls().get(i)) else { return String::new() };
+        let (action, mode) = action_of(c.kind).map_or((String::new(), Mode::Hold), |(action, mode)| (action, mode));
+        format!("{}|{}|{}|{}|{}|{}", c.id, c.label, action, mode.code(), u8::from(is_custom(&c.id)), u8::from(!action.is_empty()))
     }
 
     /// Daftar untuk digambar, satu kontrol per baris:
@@ -1294,5 +1543,204 @@ mod tests {
         let travel = 0.36 * 1080.0 / 2.0 * STICK_TRAVEL;
         assert_eq!(fields[8], format!("{travel:.1}"));
         assert_eq!(text.lines().count(), default_controls(Profile::Gamepad).len());
+    }
+
+    // ---- tombol buatan pemain ----
+
+    fn drag(o: &mut Overlay, from: (f32, f32), to: (f32, f32)) {
+        o.touch(t(TouchKind::Down, 1, from));
+        o.touch(t(TouchKind::Move, 1, to));
+        o.touch(t(TouchKind::Up, 1, to));
+    }
+
+    #[test]
+    fn player_adds_an_e_button_that_presses_e_and_survives_save_and_load() {
+        let mut o = deadlock((2400.0, 1080.0));
+        o.set_editing(true);
+        assert!(o.add_button("", "k69", Mode::Hold));
+        // Muncul di tengah layar, langsung terpilih, tulisannya nama tombol.
+        let added = o.controls().last().unwrap().clone();
+        assert_eq!((added.id.as_str(), added.label.as_str(), added.kind, added.visible), ("u1", "E", Kind::Key(vk::E), true));
+        assert_eq!(o.center("u1"), (1200.0, 540.0));
+        assert!(o.selected_info().starts_with("u1|E|k69|0|1|1"), "{}", o.selected_info());
+        drag(&mut o, (1200.0, 540.0), (1500.0, 300.0));
+        o.set_editing(false);
+        o.take_events();
+
+        assert_eq!(o.touch(t(TouchKind::Down, 1, (1500.0, 300.0))), Route::Pad);
+        assert_eq!(o.take_events(), [key(vk::E, true)]);
+        o.touch(t(TouchKind::Up, 1, (1500.0, 300.0)));
+        assert_eq!(o.take_events(), [key(vk::E, false)]);
+        assert!(o.describe().lines().any(|l| l.starts_with("u1|E|c|1500.0|300.0|")), "{}", o.describe());
+
+        let mut loaded = Overlay::from_json(&o.to_json());
+        loaded.set_view(2400.0, 1080.0);
+        assert_eq!(loaded.layouts, o.layouts);
+        assert_eq!(loaded.center("u1"), (1500.0, 300.0));
+        // Tombol buatan milik profil tempat ia dibuat saja.
+        assert!(loaded.layouts[Profile::Gamepad.index()].iter().all(|c| c.id != "u1"));
+        assert!(loaded.layouts[Profile::Minecraft.index()].iter().all(|c| c.id != "u1"));
+        // Tombol kedua mendapat id berikutnya, juga setelah dimuat ulang.
+        loaded.set_editing(true);
+        assert!(loaded.add_button("Bicara", "k84", Mode::Toggle));
+        assert_eq!(loaded.controls().last().map(|c| (c.id.as_str(), c.label.as_str(), c.kind)), Some(("u2", "Bicara", Kind::KeyToggle(vk::T))));
+    }
+
+    #[test]
+    fn custom_buttons_can_hold_toggle_aim_click_and_scroll() {
+        let mut o = deadlock((2400.0, 1080.0));
+        o.set_editing(true);
+        for (action, mode, kind) in [
+            ("k32", Mode::Hold, Kind::Key(vk::SPACE)),
+            ("k160", Mode::Toggle, Kind::KeyToggle(vk::LSHIFT)),
+            ("k69", Mode::Aim, Kind::KeyAim(vk::E)),
+            ("m1", Mode::Hold, Kind::Mouse(1)),
+            ("m3", Mode::Aim, Kind::Mouse(3)),
+            ("m3", Mode::Toggle, Kind::MouseToggle(3)),
+            ("w120", Mode::Hold, Kind::Wheel(120)),
+            ("w-120", Mode::Toggle, Kind::Wheel(-120)),
+        ] {
+            assert!(o.add_button("", action, mode), "{action}");
+            assert_eq!(o.controls().last().unwrap().kind, kind, "{action} {mode:?}");
+        }
+        // Kode yang tidak dikenal ditolak tanpa menambah apa pun.
+        let before = o.controls().len();
+        for bad in ["", "k", "k0", "k999", "m0", "m9", "w5", "x1", "kE", "é"] {
+            assert!(!o.add_button("X", bad, Mode::Hold), "{bad}");
+        }
+        assert_eq!(o.controls().len(), before);
+        // Semua pilihan yang ditawarkan ke pemain sah, unik, dan aman untuk daftar berpemisah `|`.
+        let choices = action_choices();
+        assert!(choices.iter().any(|(code, name, label)| (code.as_str(), name.as_str(), label.as_str()) == ("k69", "E", "E")));
+        for (code, name, label) in &choices {
+            assert!(kind_for(code, Mode::Hold).is_some(), "{code}");
+            assert!(!name.contains('|') && !label.contains('|') && !label.is_empty() && label.chars().count() <= LABEL_LIMIT, "{code}");
+            assert_eq!(choices.iter().filter(|c| c.0 == *code).count(), 1, "{code} ganda");
+        }
+    }
+
+    #[test]
+    fn custom_toggle_button_stays_down_until_tapped_again() {
+        let mut o = deadlock((2400.0, 1080.0));
+        o.set_editing(true);
+        assert!(o.add_button("Lari", "k160", Mode::Toggle));
+        o.set_editing(false);
+        o.take_events();
+        let at = o.center("u1");
+        o.touch(t(TouchKind::Down, 1, at));
+        o.touch(t(TouchKind::Up, 1, at));
+        assert_eq!(o.take_events(), [key(vk::LSHIFT, true)]);
+        o.touch(t(TouchKind::Down, 1, at));
+        o.touch(t(TouchKind::Up, 1, at));
+        assert_eq!(o.take_events(), [key(vk::LSHIFT, false)]);
+    }
+
+    #[test]
+    fn player_label_is_cleaned_and_limited() {
+        let mut o = deadlock((2400.0, 1080.0));
+        o.set_editing(true);
+        assert!(o.add_button("  Buka|pintu\nsekarang juga ya  ", "k69", Mode::Hold));
+        let label = o.controls().last().unwrap().label.clone();
+        assert!(!label.contains('|') && !label.contains('\n') && label.chars().count() <= LABEL_LIMIT && label.starts_with("Buka pintu"), "{label:?}");
+        // Tulisan kosong = nama tombolnya.
+        assert!(o.add_button("   ", "m3", Mode::Hold));
+        assert_eq!(o.controls().last().unwrap().label, "Kanan");
+        // Daftar gambar tetap sepuluh kolom per baris.
+        assert!(o.describe().lines().all(|l| l.split('|').count() == 10), "{}", o.describe());
+    }
+
+    #[test]
+    fn built_in_buttons_can_be_reassigned_but_sticks_and_gamepad_buttons_cannot() {
+        let mut o = deadlock((2400.0, 1080.0));
+        o.set_editing(true);
+        // Belum ada yang terpilih.
+        assert_eq!(o.selected_info(), "");
+        assert!(!o.change_selected("X", "k88", Mode::Hold));
+        // "Isi" (R) diganti menjadi G yang hidup/mati dengan tulisan sendiri.
+        let at = o.center("reload");
+        drag(&mut o, at, at);
+        assert_eq!(o.selected_info(), "reload|Isi|k82|0|0|1");
+        assert!(o.change_selected("Granat", "k71", Mode::Toggle));
+        let reload = o.controls().iter().find(|c| c.id == "reload").unwrap().clone();
+        assert_eq!((reload.label.as_str(), reload.kind), ("Granat", Kind::KeyToggle(0x47)));
+        // Stik gerak tidak bisa dijadikan tombol.
+        let at = o.center("move");
+        drag(&mut o, at, at);
+        assert_eq!(o.selected_info(), "move|||0|0|0");
+        assert!(!o.change_selected("X", "k88", Mode::Hold));
+        o.set_editing(false);
+
+        // Yang ditulis ke file hanya tombol yang memang diubah pemain.
+        let json: serde_json::Value = serde_json::from_str(&o.to_json()).unwrap();
+        let with_action: Vec<&str> = json["deadlock"].as_array().unwrap().iter().filter(|c| c.get("action").is_some()).map(|c| c["id"].as_str().unwrap()).collect();
+        assert_eq!(with_action, ["reload"]);
+        let loaded = Overlay::from_json(&o.to_json());
+        assert_eq!(loaded.layouts, o.layouts);
+
+        // Tombol gamepad (A) juga tidak bisa diubah.
+        let mut pad = overlay((2400.0, 1080.0));
+        pad.set_editing(true);
+        let at = pad.center("a");
+        drag(&mut pad, at, at);
+        assert!(!pad.change_selected("X", "k88", Mode::Hold));
+        // (Posisi boleh bergeser sepersekian piksel karena ketukan memilih ikut dihitung sebagai geseran.)
+        let kinds = |controls: &[Control]| controls.iter().map(|c| (c.id.clone(), c.label.clone(), c.kind)).collect::<Vec<_>>();
+        assert_eq!(kinds(pad.controls()), kinds(&default_controls(Profile::Gamepad)));
+    }
+
+    #[test]
+    fn delete_removes_custom_buttons_and_only_hides_built_in_ones() {
+        let mut o = deadlock((2400.0, 1080.0));
+        let built_in = default_controls(Profile::Deadlock).len();
+        o.set_editing(true);
+        assert!(o.add_button("", "k69", Mode::Hold));
+        assert!(o.add_button("", "k70", Mode::Hold));
+        assert_eq!(o.controls().len(), built_in + 2);
+        // Tombol buatan yang terpilih (yang terakhir ditambah) benar-benar hilang.
+        o.edit(EditAction::Delete);
+        assert_eq!(o.controls().len(), built_in + 1);
+        assert!(o.controls().iter().any(|c| c.id == "u1") && o.controls().iter().all(|c| c.id != "u2"));
+        assert_eq!(o.selected_info(), "");
+        // Tanpa pilihan: tidak terjadi apa-apa.
+        o.edit(EditAction::Delete);
+        assert_eq!(o.controls().len(), built_in + 1);
+        // Tombol bawaan hanya disembunyikan.
+        let at = o.center("jump");
+        drag(&mut o, at, at);
+        o.edit(EditAction::Delete);
+        assert_eq!(o.controls().len(), built_in + 1);
+        assert!(!o.controls().iter().find(|c| c.id == "jump").unwrap().visible);
+        // "Bawaan" membuang tombol buatan di profil ini.
+        o.edit(EditAction::Reset);
+        assert_eq!(o.controls(), default_controls(Profile::Deadlock).as_slice());
+    }
+
+    #[test]
+    fn custom_buttons_are_limited_and_bad_saved_entries_are_ignored() {
+        let mut o = deadlock((2400.0, 1080.0));
+        o.set_editing(true);
+        for _ in 0..CUSTOM_LIMIT {
+            assert!(o.add_button("", "k69", Mode::Hold));
+        }
+        assert!(!o.add_button("", "k69", Mode::Hold), "lebih dari batas ditolak");
+
+        let built_in = default_controls(Profile::Minecraft).len();
+        let saved = format!(
+            r#"{{"version":{VERSION},"shown":true,"profile":"minecraft","minecraft":[
+                {{"id":"u7","side":"right","x":0.5,"y":0.4,"size":0.2,"visible":true,"label":"Peta","action":"k77","mode":"hold"}},
+                {{"id":"u8","side":"left","x":0.5,"y":0.4,"size":0.2,"visible":true,"label":"Rusak","action":"k0"}},
+                {{"id":"u9","side":"left","x":0.5,"y":0.4,"size":0.2,"visible":true}},
+                {{"id":"asing","side":"left","x":0.5,"y":0.4,"size":0.2,"visible":true,"action":"k77"}},
+                {{"id":"move","side":"left","x":0.3,"y":0.7,"size":0.3,"visible":true,"action":"k77","label":"Bukan stik"}}
+            ]}}"#
+        );
+        let loaded = Overlay::from_json(&saved);
+        let controls = loaded.controls();
+        assert_eq!(controls.len(), built_in + 1, "hanya u7 yang sah");
+        let peta = controls.last().unwrap();
+        assert_eq!((peta.id.as_str(), peta.label.as_str(), peta.kind, peta.side, peta.size), ("u7", "Peta", Kind::Key(0x4D), Side::Right, 0.2));
+        // Stik tidak berubah jenis walau file menyuruhnya; posisinya tetap diterapkan.
+        let stick = controls.iter().find(|c| c.id == "move").unwrap();
+        assert!(matches!(stick.kind, Kind::KeyStick { .. }) && stick.label.is_empty() && stick.x == 0.3);
     }
 }

@@ -21,6 +21,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.text.InputFilter
 import android.text.InputType
 import android.util.TypedValue
 import android.view.Gravity
@@ -40,9 +41,15 @@ import android.view.inputmethod.BaseInputConnection
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
+import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.PopupMenu
+import android.widget.ScrollView
+import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import android.window.OnBackInvokedCallback
@@ -221,19 +228,27 @@ class StreamActivity : Activity(), SurfaceHolder.Callback, InputManager.InputDev
 
         // Mode atur stik layar: geser tombol untuk memindahkan, lalu ubah yang terpilih dengan tombol-tombol ini.
         val editRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        editRow.addView(barButton("+ Tombol") { showButtonDialog(false) })
+        editRow.addView(barButton("Ubah") { showButtonDialog(true) })
         editRow.addView(barButton("Kecilkan") { editAction(2) })
         editRow.addView(barButton("Besarkan") { editAction(1) })
-        editRow.addView(barButton("Sembunyikan / tampilkan") { editAction(3) })
-        editRow.addView(barButton("Bawaan") { editAction(4) })
+        editRow.addView(barButton("Sembunyi / tampil") { editAction(3) })
+        editRow.addView(barButton("Hapus") { deleteSelected() })
+        editRow.addView(barButton("Bawaan") { confirmReset() })
         editRow.addView(barButton("Selesai") { setEditing(false) })
+        // Di HP yang layarnya sempit deretan ini bisa lebih lebar dari layar: bisa digeser ke samping.
+        val editScroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            addView(editRow)
+        }
         editBar = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
             visibility = View.GONE
         }
-        editBar.addView(editRow)
+        editBar.addView(editScroll)
         editBar.addView(TextView(this).apply {
-            text = "Geser tombol untuk memindahkan. Ketuk tombol untuk memilihnya, lalu besarkan, kecilkan, atau sembunyikan."
+            text = "\"+ Tombol\" menambah tombol sendiri. Geser tombol untuk memindahkan; ketuk untuk memilihnya, lalu ubah, besarkan, kecilkan, sembunyikan, atau hapus."
             setTextColor(Color.WHITE)
             textSize = 12f
             gravity = Gravity.CENTER
@@ -504,7 +519,7 @@ class StreamActivity : Activity(), SurfaceHolder.Callback, InputManager.InputDev
         menu.menu.add(0, 1, 0, mark(shown && profile == 0) + "Gamepad (stik Xbox)")
         menu.menu.add(0, 2, 0, mark(shown && profile == 1) + "Minecraft (joystick + tombol)")
         menu.menu.add(0, 4, 0, mark(shown && profile == 2) + "Deadlock (tembak + skill)")
-        menu.menu.add(0, 3, 0, "Atur posisi dan ukuran tombol")
+        menu.menu.add(0, 3, 0, "Atur tombol: tambah, ubah, pindah, ukuran")
         menu.menu.add(0, 5, 0, mark(gyro) + "Gyro: bidik dengan memiringkan HP")
         if (gyro) menu.menu.add(0, 6, 0, mark(inverted) + "Balik arah gyro")
         menu.setOnMenuItemClickListener { item ->
@@ -687,6 +702,137 @@ class StreamActivity : Activity(), SurfaceHolder.Callback, InputManager.InputDev
         if (current == 0L) return
         Native.padEditAction(current, action)
         padView.invalidate()
+    }
+
+    private fun toast(text: String) = Toast.makeText(this, text, Toast.LENGTH_LONG).show()
+
+    /** Pilihan aksi tombol buatan pemain dari `overlay.rs`: (kode, nama di daftar, tulisan bawaan). */
+    private val padChoices: List<Triple<String, String, String>> by lazy {
+        Native.padChoices().lines().mapNotNull { line ->
+            val fields = line.split('|')
+            if (fields.size >= 3) Triple(fields[0], fields[1], fields[2]) else null
+        }
+    }
+
+    /**
+     * Mode atur: tambah tombol sendiri (`change` = false) atau ubah tombol yang terpilih. Pemain memilih tombol keyboard/
+     * mouse yang ditekan, cara kerjanya, dan tulisan di tombol; semuanya langsung tersimpan di HP ini, per profil.
+     */
+    private fun showButtonDialog(change: Boolean) {
+        val current = handle
+        if (current == 0L || padChoices.isEmpty()) return
+        var action = "k69" // E: tombol "pakai/ambil" di banyak game
+        var mode = 0
+        var label: String? = null
+        if (change) {
+            val info = Native.padSelected(current).split('|')
+            if (info.size < 6) {
+                toast("Ketuk dulu tombol yang mau diubah.")
+                return
+            }
+            if (info[5] != "1") {
+                toast("Stik, d-pad, dan tombol gamepad tidak bisa diubah. Sembunyikan saja, lalu tambah tombol baru dengan \"+ Tombol\".")
+                return
+            }
+            label = info[1]
+            action = info[2]
+            mode = info[3].toIntOrNull() ?: 0
+        }
+        val builder = AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+        val context = builder.context
+        val start = padChoices.indexOfFirst { it.first == action }.coerceAtLeast(0)
+        fun caption(text: String) = TextView(context).apply {
+            this.text = text
+            textSize = 13f
+            setPadding(0, dp(10f), 0, dp(2f))
+        }
+        val actionSpinner = Spinner(context).apply {
+            adapter = ArrayAdapter(context, android.R.layout.simple_spinner_dropdown_item, padChoices.map { it.second })
+            setSelection(start)
+        }
+        val modeSpinner = Spinner(context).apply {
+            adapter = ArrayAdapter(
+                context, android.R.layout.simple_spinner_dropdown_item,
+                listOf("Tahan: ditekan selama jari menempel", "Hidup/mati: ketuk sekali nyala, ketuk lagi mati", "Tahan sambil mengarahkan: geser jari = gerakkan mouse"),
+            )
+            setSelection(mode.coerceIn(0, 2))
+        }
+        val labelInput = EditText(context).apply {
+            setSingleLine()
+            filters = arrayOf(InputFilter.LengthFilter(12))
+            hint = "kosong = nama tombolnya"
+            imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI or EditorInfo.IME_ACTION_DONE
+            setText(label ?: padChoices[start].third)
+        }
+        // Tulisan mengikuti tombol yang dipilih selama pemain belum menulis sendiri.
+        var suggested = padChoices[start].third
+        actionSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                val next = padChoices.getOrNull(position)?.third ?: return
+                val typed = labelInput.text.toString()
+                if (typed.isBlank() || typed == suggested) labelInput.setText(next)
+                suggested = next
+            }
+
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
+        }
+        val box = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(22f), dp(4f), dp(22f), 0)
+            addView(caption("Tombol yang ditekan di PC"))
+            addView(actionSpinner)
+            addView(caption("Cara kerja"))
+            addView(modeSpinner)
+            addView(caption("Tulisan di tombol (paling banyak 12 huruf)"))
+            addView(labelInput)
+        }
+        builder.setTitle(if (change) "Ubah tombol" else "Tambah tombol")
+            .setView(ScrollView(context).apply { addView(box) })
+            .setPositiveButton(if (change) "Simpan" else "Tambah") { _, _ ->
+                val now = handle
+                val choice = padChoices.getOrNull(actionSpinner.selectedItemPosition)
+                if (now != 0L && choice != null) {
+                    val text = labelInput.text.toString()
+                    val picked = modeSpinner.selectedItemPosition
+                    val done = if (change) Native.padChange(now, text, choice.first, picked) else Native.padAdd(now, text, choice.first, picked)
+                    padView.invalidate()
+                    toast(
+                        when {
+                            done && change -> "Tombol diubah menjadi ${choice.second}."
+                            done -> "Tombol ${choice.second} ditambahkan di tengah layar. Geser ke tempat yang kamu mau, lalu Selesai."
+                            change -> "Tombol ini tidak bisa diubah."
+                            else -> "Tombol tidak bisa ditambah: tombol buatan di profil ini sudah terlalu banyak."
+                        },
+                    )
+                }
+            }
+            .setNegativeButton("Batal", null)
+            .setOnDismissListener { hideSystemBars() }
+            .show()
+    }
+
+    /** Mode atur: hapus tombol buatan pemain yang terpilih (tombol bawaan hanya disembunyikan). */
+    private fun deleteSelected() {
+        val current = handle
+        if (current == 0L) return
+        val info = Native.padSelected(current).split('|')
+        if (info.size < 6) {
+            toast("Ketuk dulu tombol yang mau dihapus.")
+            return
+        }
+        Native.padEditAction(current, 5)
+        padView.invalidate()
+        toast(if (info[4] == "1") "Tombol \"${info[1]}\" dihapus." else "Tombol bawaan tidak dihapus, hanya disembunyikan. Ketuk lagi lalu \"Sembunyi / tampil\" untuk memunculkannya.")
+    }
+
+    /** Mode atur: kembali ke bawaan membuang juga tombol buatan pemain di profil ini, jadi ditanya dulu. */
+    private fun confirmReset() {
+        AlertDialog.Builder(this)
+            .setMessage("Kembalikan semua tombol di profil ini ke bawaan CloudPC? Posisi, ukuran, dan tombol yang kamu tambah sendiri di profil ini akan hilang.")
+            .setPositiveButton("Kembalikan") { _, _ -> editAction(4) }
+            .setNegativeButton("Batal", null)
+            .setOnDismissListener { hideSystemBars() }
+            .show()
     }
 
     /**

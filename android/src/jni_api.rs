@@ -25,7 +25,7 @@ use ndk::native_window::NativeWindow;
 
 use crate::audio::AndroidAudio;
 use crate::gesture::{Action, Touch, TouchKind};
-use crate::overlay::{EditAction, Event as PadEvent, Profile, Route};
+use crate::overlay::{EditAction, Event as PadEvent, Mode as PadMode, Profile, Route};
 use crate::pad::{Axes, PadState, VIRTUAL_DEVICE};
 use crate::report::{event_lines, global_stats, Log};
 use crate::state::Shared;
@@ -557,7 +557,8 @@ pub extern "system" fn Java_id_cloudpc_stream_Native_padEdit<'l>(_env: JNIEnv<'l
     })
 }
 
-/// Tombol mode atur: 1 perbesar, 2 perkecil, 3 sembunyikan/tampilkan kontrol terpilih, 4 kembali ke tata letak bawaan.
+/// Tombol mode atur: 1 perbesar, 2 perkecil, 3 sembunyikan/tampilkan kontrol terpilih, 4 kembali ke tata letak bawaan,
+/// 5 hapus tombol buatan pemain yang terpilih. Langsung disimpan (pemain bisa meninggalkan layar tanpa menekan Selesai).
 #[no_mangle]
 pub extern "system" fn Java_id_cloudpc_stream_Native_padEditAction<'l>(_env: JNIEnv<'l>, _class: JClass<'l>, handle: jlong, action: jint) {
     let Some(session) = session(handle) else { return };
@@ -565,6 +566,51 @@ pub extern "system" fn Java_id_cloudpc_stream_Native_padEditAction<'l>(_env: JNI
         if let (Some(action), Ok(mut overlay)) = (EditAction::from_code(action), session.shared.overlay.lock()) {
             overlay.edit(action);
         }
+        release_overlay(&session.shared);
+        session.shared.save_overlay();
+    })
+}
+
+/// Pilihan aksi untuk tombol buatan pemain, satu per baris: `kode|nama di daftar|tulisan bawaan` (`overlay::action_choices`).
+#[no_mangle]
+pub extern "system" fn Java_id_cloudpc_stream_Native_padChoices<'l>(mut env: JNIEnv<'l>, _class: JClass<'l>) -> jstring {
+    let text: String = crate::overlay::action_choices().iter().map(|(code, name, label)| format!("{code}|{name}|{label}\n")).collect();
+    to_java(&mut env, &text)
+}
+
+/// Kontrol terpilih di mode atur (`Overlay::selected_info`); kosong = belum ada yang terpilih.
+#[no_mangle]
+pub extern "system" fn Java_id_cloudpc_stream_Native_padSelected<'l>(mut env: JNIEnv<'l>, _class: JClass<'l>, handle: jlong) -> jstring {
+    let text = session(handle).and_then(|s| s.shared.overlay.lock().ok().map(|o| o.selected_info())).unwrap_or_default();
+    to_java(&mut env, &text)
+}
+
+/// Tambah tombol buatan pemain (`mode`: 0 tahan, 1 hidup/mati, 2 tahan sambil mengarahkan). Langsung disimpan di HP.
+#[no_mangle]
+pub extern "system" fn Java_id_cloudpc_stream_Native_padAdd<'l>(mut env: JNIEnv<'l>, _class: JClass<'l>, handle: jlong, label: JString<'l>, action: JString<'l>, mode: jint) -> jboolean {
+    let (label, action) = (string(&mut env, &label), string(&mut env, &action));
+    let Some(session) = session(handle) else { return JNI_FALSE };
+    guarded(JNI_FALSE, || {
+        let added = session.shared.overlay.lock().is_ok_and(|mut o| o.add_button(&label, &action, PadMode::from_code(mode)));
+        if added {
+            session.shared.save_overlay();
+        }
+        flag(added)
+    })
+}
+
+/// Ganti aksi, cara kerja, dan tulisan kontrol terpilih. Langsung disimpan di HP.
+#[no_mangle]
+pub extern "system" fn Java_id_cloudpc_stream_Native_padChange<'l>(mut env: JNIEnv<'l>, _class: JClass<'l>, handle: jlong, label: JString<'l>, action: JString<'l>, mode: jint) -> jboolean {
+    let (label, action) = (string(&mut env, &label), string(&mut env, &action));
+    let Some(session) = session(handle) else { return JNI_FALSE };
+    guarded(JNI_FALSE, || {
+        let changed = session.shared.overlay.lock().is_ok_and(|mut o| o.change_selected(&label, &action, PadMode::from_code(mode)));
+        if changed {
+            release_overlay(&session.shared);
+            session.shared.save_overlay();
+        }
+        flag(changed)
     })
 }
 

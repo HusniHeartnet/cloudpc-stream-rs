@@ -63,8 +63,18 @@ object Native {
     @JvmStatic external fun padProfile(handle: Long): Int
     @JvmStatic external fun padSetProfile(handle: Long, profile: Int)
     @JvmStatic external fun padEdit(handle: Long, editing: Boolean)
-    /** 1 perbesar, 2 perkecil, 3 sembunyikan/tampilkan kontrol terpilih, 4 kembali ke bawaan. */
+    /** 1 perbesar, 2 perkecil, 3 sembunyikan/tampilkan kontrol terpilih, 4 kembali ke bawaan, 5 hapus tombol buatan pemain. */
     @JvmStatic external fun padEditAction(handle: Long, action: Int)
+
+    // Tombol buatan pemain (mode atur). Semua perubahan langsung disimpan di HP, per profil.
+    /** Pilihan aksi, satu per baris: `kode|nama di daftar|tulisan bawaan` (tombol keyboard, tombol mouse, roda mouse). */
+    @JvmStatic external fun padChoices(): String
+    /** Kontrol terpilih: `id|tulisan|kode aksi|cara kerja|buatan pemain(0/1)|bisa diubah(0/1)`; kosong = belum ada. */
+    @JvmStatic external fun padSelected(handle: Long): String
+    /** Tambah tombol di tengah layar. `mode`: 0 tahan, 1 hidup/mati, 2 tahan sambil mengarahkan. */
+    @JvmStatic external fun padAdd(handle: Long, label: String, action: String, mode: Int): Boolean
+    /** Ganti aksi, cara kerja, dan tulisan kontrol terpilih. */
+    @JvmStatic external fun padChange(handle: Long, label: String, action: String, mode: Int): Boolean
     /** Baris `id|label|bentuk|cx|cy|lebar|tinggi|tanda|kx|ky` per kontrol (lihat `Overlay::describe`). */
     @JvmStatic external fun padDraw(handle: Long): String
 }
