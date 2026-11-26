@@ -236,11 +236,17 @@ pub fn packet_size_for(ip: IpAddr) -> u32 {
 /// invalidasi H.264 pada decoder yang menyatakan sanggup (`CAPABILITY_REFERENCE_FRAME_INVALIDATION_AVC`): setelah
 /// invalidasi decoder menerima aliran dengan nomor frame yang melompat, dan decoder GPU tertentu lalu menampilkan
 /// gambar lama berulang-ulang atau gelap sampai IDR berikutnya (sesi #117, 24 Nov 2026, grafis terpadu AMD Radeon 660M;
-/// pada NVIDIA dan decoder perangkat lunak hasilnya benar, tetapi client tidak memilah merek GPU). HEVC dan AV1 membawa
-/// daftar frame rujukan di tiap frame, jadi tetap memakai invalidasi. `hardware`: codec yang didecode hardware oleh
-/// penampil; `None` = tanpa penampil (rekam saja).
+/// pada NVIDIA dan decoder perangkat lunak FFmpeg hasilnya benar, tetapi client tidak memilah merek GPU). AV1: gejala yang
+/// sama dilaporkan 26 Nov 2026 di PC dan HP; AV1 SELALU satu frame rujukan, juga saat didecode perangkat lunak (dav1d di
+/// Mac M1/M2, decoder perangkat lunak MediaCodec di HP tanpa AV1 hardware: keduanya belum diuji dengan invalidasi).
+/// Hanya HEVC (dan H.264 di CPU) yang tetap memakai invalidasi. `hardware`: codec yang didecode hardware oleh penampil;
+/// `None` = tanpa penampil (rekam saja).
 pub fn needs_single_reference(codec: Codec, hardware: Option<&[Codec]>) -> bool {
-    codec == Codec::H264 && hardware.is_some_and(|codecs| codecs.contains(&Codec::H264))
+    match codec {
+        Codec::H264 => hardware.is_some_and(|codecs| codecs.contains(&Codec::H264)),
+        Codec::Av1 => hardware.is_some(),
+        Codec::Hevc => false,
+    }
 }
 
 /// Codec akhir dari pilihan pengguna dan yang dinyatakan host (`ServerCodecModeSupport` + DESCRIBE).
@@ -602,7 +608,9 @@ mod tests {
         assert!(needs_single_reference(Codec::H264, Some(&all)));
         // HEVC dan AV1 tetap memakai invalidasi frame rujukan.
         assert!(!needs_single_reference(Codec::Hevc, Some(&all)));
-        assert!(!needs_single_reference(Codec::Av1, Some(&all)));
+        assert!(needs_single_reference(Codec::Av1, Some(&all)));
+        assert!(needs_single_reference(Codec::Av1, Some(&[Codec::H264, Codec::Hevc])));
+        assert!(!needs_single_reference(Codec::Av1, None));
         // H.264 di CPU (GPU tanpa decoder H.264, atau `--video-decoder software`) dan tanpa penampil: tidak dibatasi.
         assert!(!needs_single_reference(Codec::H264, Some(&[Codec::Hevc])));
         assert!(!needs_single_reference(Codec::H264, Some(&[])));

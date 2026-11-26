@@ -226,19 +226,22 @@ impl session::VideoSink for TypeSink {
 /// Sesi #117 (24 Nov 2026): H.264 di decoder GPU AMD menampilkan gambar lama berulang-ulang setelah frame hilang
 /// dipulihkan dengan invalidasi frame rujukan. Sekarang H.264 pada decoder hardware meminta satu frame rujukan: tiap
 /// celah di aliran yang sampai ke decoder harus dilanjutkan oleh IDR, tidak pernah oleh P-frame jenis 5. H.264 di CPU
-/// (decoder perangkat lunak) tetap memakai invalidasi. Host membuang paket berkelompok; tanpa jendela.
+/// (decoder perangkat lunak) tetap memakai invalidasi. AV1 (26 Nov 2026, gejala sama di PC dan HP): SELALU IDR, juga
+/// di decoder perangkat lunak. Host membuang paket berkelompok; tanpa jendela.
 #[test]
-fn h264_on_a_hardware_decoder_recovers_lost_frames_with_idr() {
+fn h264_and_av1_recover_lost_frames_with_idr() {
     use cloudpc_stream_client::rtsp::Codec;
     use cloudpc_stream_proto::video::FrameType;
     let _turn = streaming();
-    let rig = rig_custom(false, None, (120, 4));
-    pair(&rig, "4821", "4821").unwrap();
-    let store = Store::open(rig.data.path()).unwrap();
-    // Setelan sesi #117: 720p 30 FPS 1 Mbps H.264.
-    let options = StreamOptions { app: "Desktop".into(), width: 1280, height: 720, fps: 30, bitrate_kbps: 1_000, codec: CodecChoice::Only(Codec::H264), dump_video: None, ..Default::default() };
-    for hardware in [vec![Codec::H264, Codec::Hevc], Vec::new()] {
-        let on_gpu = !hardware.is_empty();
+    // Setelan sesi #117: 720p 30 FPS 1 Mbps.
+    for (codec, hardware) in [(Codec::H264, vec![Codec::H264, Codec::Hevc]), (Codec::H264, Vec::new()), (Codec::Av1, vec![Codec::Av1]), (Codec::Av1, Vec::new())] {
+        let options = StreamOptions { app: "Desktop".into(), width: 1280, height: 720, fps: 30, bitrate_kbps: 1_000, codec: CodecChoice::Only(codec), dump_video: None, ..Default::default() };
+        // Host baru tiap kasus: sesi berturut-turut di host uji yang sama kadang langsung putus setelah `quit`.
+        let rig = rig_custom(false, None, (120, 4));
+        pair(&rig, "4821", "4821").unwrap();
+        let store = Store::open(rig.data.path()).unwrap();
+        // H.264 di GPU dan AV1 di mana pun: IDR. H.264 di CPU: invalidasi.
+        let on_gpu = !hardware.is_empty() || codec == Codec::Av1;
         let mut sink = TypeSink { hardware, frames: Vec::new() };
         let started = Instant::now();
         let outputs = session::Outputs { video: Some(&mut sink), ..Default::default() };
@@ -248,13 +251,13 @@ fn h264_on_a_hardware_decoder_recovers_lost_frames_with_idr() {
         assert_eq!(sink.frames.first().map(|f| f.1), Some(FrameType::Idr), "aliran dimulai dari IDR");
         // Frame pertama setelah tiap celah nomor frame.
         let resumes: Vec<FrameType> = sink.frames.windows(2).filter(|w| w[1].0 != w[0].0 + 1).map(|w| w[1].1).collect();
-        assert!(!resumes.is_empty(), "ada celah yang dipulihkan: {report:?}");
+        assert!(report.invalidations_sent + report.idr_requests_sent >= 1, "{codec:?}: client sempat meminta pemulihan: {report:?}");
         if on_gpu {
-            assert_eq!((report.invalidations_sent, report.idr_requests_sent >= 1), (0, true), "decoder GPU: minta IDR, bukan invalidasi: {report:?}");
+            assert_eq!((report.invalidations_sent, report.idr_requests_sent >= 1), (0, true), "{codec:?}: minta IDR, bukan invalidasi: {report:?}");
             assert!(resumes.iter().all(|t| *t == FrameType::Idr), "decoder GPU: tiap celah dilanjutkan IDR: {resumes:?}");
             assert!(sink.frames.iter().all(|f| f.1 != FrameType::AfterRefInvalidation), "decoder GPU tidak pernah menerima P-frame hasil invalidasi");
         } else {
-            assert!(report.invalidations_sent >= 1, "decoder perangkat lunak tetap memakai invalidasi: {report:?}");
+            assert!(report.invalidations_sent >= 1, "{codec:?} decoder perangkat lunak tetap memakai invalidasi: {report:?}");
             assert!(resumes.contains(&FrameType::AfterRefInvalidation), "decoder perangkat lunak: celah dilanjutkan P-frame jenis 5: {resumes:?}");
         }
     }
