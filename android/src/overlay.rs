@@ -43,6 +43,15 @@ const DPAD_DEAD: f32 = 0.22;
 const KEY_STICK_DEAD: f32 = 0.30;
 /// Stik gerak keyboard didorong sejauh ini ke depan = tombol lari ikut ditahan.
 const SPRINT_AT: f32 = 0.95;
+/// Stik gerak dengan tombol dash: jari keluar sejauh ini dari pusat (satuan jari-jari stik, jadi di luar gambar stik,
+/// ditandai cincin putus-putus) = dash ditekan; dilepas lagi setelah jari kembali ke dalam `STICK_DASH_OFF`, jadi satu
+/// dorongan = satu dash.
+const STICK_DASH_AT: f32 = 1.25;
+const STICK_DASH_OFF: f32 = 1.0;
+/// Revisi tata letak bawaan Deadlock. 2 = tata letak dua jempol (26 Nov 2026): gerakan dan pertarungan di jempol kanan,
+/// dash dari dorongan stik. Posisi tombol bawaan yang tersimpan dari revisi lama diganti posisi baru; tombol buatan
+/// pemain, tombol yang aksinya ia ubah, dan pilihan sembunyikan tetap.
+const DEADLOCK_LAYOUT: u32 = 2;
 /// Tombol buatan pemain: jumlah terbanyak per profil, panjang tulisan, dan ukuran saat baru dibuat.
 const CUSTOM_LIMIT: usize = 40;
 const LABEL_LIMIT: usize = 12;
@@ -116,8 +125,9 @@ pub enum Kind {
     Shoulder(u32),
     LeftTrigger,
     RightTrigger,
-    /// Stik gerak keyboard: [atas, kiri, bawah, kanan] = empat tombol; didorong penuh ke atas = `sprint` ikut ditahan.
-    KeyStick { keys: [u16; 4], sprint: u16 },
+    /// Stik gerak keyboard: [atas, kiri, bawah, kanan] = empat tombol; didorong penuh ke atas = `sprint` ikut ditahan;
+    /// jari keluar melewati cincin di sekeliling stik ke arah mana pun = `dash` ditekan sekali (0 = tidak ada).
+    KeyStick { keys: [u16; 4], sprint: u16, dash: u16 },
     /// Tombol keyboard, ditahan selama jari menempel.
     Key(u16),
     /// Tombol keyboard yang berganti hidup/mati tiap ketukan (jongkok).
@@ -337,6 +347,9 @@ struct Saved {
     minecraft: Vec<SavedControl>,
     #[serde(default)]
     deadlock: Vec<SavedControl>,
+    /// `DEADLOCK_LAYOUT` saat disimpan; 0 = file dari sebelum ada revisi.
+    #[serde(default)]
+    deadlock_layout: u32,
     /// Bidik dengan memiringkan HP (gyro), dan arahnya dibalik.
     #[serde(default)]
     gyro: bool,
@@ -368,7 +381,7 @@ pub fn default_controls(profile: Profile) -> Vec<Control> {
         // Tombol bawaan Minecraft Java: WASD, Spasi lompat, Shift jongkok, Ctrl lari, E tas, Q buang, F tangan kiri,
         // klik kiri pukul/hancurkan, klik kanan pakai/pasang, roda = ganti slot, T chat, F5 sudut pandang.
         Profile::Minecraft => vec![
-            c("move", "", Kind::KeyStick { keys: [vk::W, vk::A, vk::S, vk::D], sprint: vk::LCONTROL }, Side::Left, 0.24, 0.70, 0.36),
+            c("move", "", Kind::KeyStick { keys: [vk::W, vk::A, vk::S, vk::D], sprint: vk::LCONTROL, dash: 0 }, Side::Left, 0.24, 0.70, 0.36),
             c("sneak", "Jongkok", Kind::KeyToggle(vk::LSHIFT), Side::Left, 0.56, 0.86, 0.13),
             c("drop", "Buang", Kind::Key(vk::Q), Side::Left, 0.56, 0.62, 0.10),
             c("esc", "Esc", Kind::Key(vk::ESCAPE), Side::Left, 0.10, 0.24, 0.09),
@@ -384,12 +397,13 @@ pub fn default_controls(profile: Profile) -> Vec<Control> {
         ],
         // Tombol bawaan Deadlock (ditulis dari ingatan, cocokkan dengan pengaturan game): WASD, Spasi lompat/zipline,
         // Shift dash, Ctrl jongkok/slide, klik kiri tembak, klik kanan bidik, R isi peluru, Q pukul, F tangkis,
-        // 1-4 skill, Z/X/C/V item aktif, B toko, Tab papan skor, klik tengah ping. Skill dan item memakai KeyAim:
-        // tahan, geser untuk mengarahkan, lepas (cocok dengan cast "saat dilepas" di pengaturan game).
+        // 1-4 skill, Z/X/C/V item aktif, B toko, Tab papan skor, klik tengah ping.
+        // Dimainkan dua jempol (revisi `DEADLOCK_LAYOUT` 2): jempol kiri hanya stik jalan (dorong melewati cincinnya =
+        // dash), jempol kanan membidik sekaligus menekan semua tombol bertarung yang mengelilingi Tembak. Semua tombol di
+        // kanan, skill, dan item bawaannya "tahan sambil mengarahkan" (KeyAim): selama jempol menempel, geseran jempol
+        // memutar kamera, jadi serudukan/pukulan/skill bisa dibelokkan. Pemain bisa menggantinya lewat "Ubah".
         Profile::Deadlock => vec![
-            c("move", "", Kind::KeyStick { keys: [vk::W, vk::A, vk::S, vk::D], sprint: 0 }, Side::Left, 0.25, 0.70, 0.34),
-            c("dash", "Dash", Kind::Key(vk::LSHIFT), Side::Left, 0.55, 0.55, 0.14),
-            c("slide", "Slide", Kind::Key(vk::LCONTROL), Side::Left, 0.57, 0.80, 0.13),
+            c("move", "", Kind::KeyStick { keys: [vk::W, vk::A, vk::S, vk::D], sprint: 0, dash: vk::LSHIFT }, Side::Left, 0.25, 0.68, 0.34),
             c("shop", "Toko", Kind::DirectToggle(vk::B), Side::Left, 0.10, 0.24, 0.10),
             c("score", "Skor", Kind::Key(vk::TAB), Side::Left, 0.25, 0.24, 0.09),
             c("esc", "Esc", Kind::Key(vk::ESCAPE), Side::Left, 0.40, 0.24, 0.09),
@@ -397,17 +411,19 @@ pub fn default_controls(profile: Profile) -> Vec<Control> {
             c("item2", "X", Kind::KeyAim(vk::X), Side::Left, 0.81, 0.91, 0.09),
             c("item3", "C", Kind::KeyAim(vk::C), Side::Right, 0.81, 0.91, 0.09),
             c("item4", "V", Kind::KeyAim(vk::V), Side::Right, 0.70, 0.91, 0.09),
-            c("fire", "Tembak", Kind::Mouse(1), Side::Right, 0.23, 0.75, 0.22),
-            c("ads", "Bidik", Kind::MouseToggle(3), Side::Right, 0.08, 0.92, 0.10),
-            c("skill1", "1", Kind::KeyAim(vk::N1), Side::Right, 0.483, 0.852, 0.13),
-            c("skill2", "2", Kind::KeyAim(vk::N1 + 1), Side::Right, 0.49, 0.69, 0.13),
-            c("skill3", "3", Kind::KeyAim(vk::N1 + 2), Side::Right, 0.403, 0.552, 0.13),
-            c("skill4", "4", Kind::KeyAim(vk::N1 + 3), Side::Right, 0.255, 0.49, 0.13),
-            c("jump", "Lompat", Kind::Key(vk::SPACE), Side::Right, 0.10, 0.50, 0.14),
-            c("reload", "Isi", Kind::Key(vk::R), Side::Right, 0.58, 0.53, 0.10),
-            c("parry", "Tangkis", Kind::Key(vk::F), Side::Right, 0.65, 0.65, 0.10),
-            c("melee", "Pukul", Kind::Key(vk::Q), Side::Right, 0.662, 0.79, 0.12),
-            c("ping", "Ping", Kind::Mouse(2), Side::Right, 0.52, 0.30, 0.09),
+            c("fire", "Tembak", Kind::Mouse(1), Side::Right, 0.26, 0.73, 0.22),
+            c("jump", "Lompat", Kind::KeyAim(vk::SPACE), Side::Right, 0.11, 0.51, 0.16),
+            c("dash", "Dash", Kind::KeyAim(vk::LSHIFT), Side::Right, 0.31, 0.50, 0.14),
+            c("slide", "Slide", Kind::KeyAim(vk::LCONTROL), Side::Right, 0.45, 0.60, 0.12),
+            c("melee", "Pukul", Kind::KeyAim(vk::Q), Side::Right, 0.48, 0.78, 0.13),
+            c("parry", "Tangkis", Kind::KeyAim(vk::F), Side::Right, 0.54, 0.93, 0.12),
+            c("reload", "Isi", Kind::KeyAim(vk::R), Side::Right, 0.25, 0.92, 0.09),
+            c("ads", "Bidik", Kind::MouseToggle(3), Side::Right, 0.08, 0.91, 0.10),
+            c("skill1", "1", Kind::KeyAim(vk::N1), Side::Right, 0.69, 0.73, 0.13),
+            c("skill2", "2", Kind::KeyAim(vk::N1 + 1), Side::Right, 0.66, 0.56, 0.13),
+            c("skill3", "3", Kind::KeyAim(vk::N1 + 2), Side::Right, 0.57, 0.41, 0.13),
+            c("skill4", "4", Kind::KeyAim(vk::N1 + 3), Side::Right, 0.43, 0.30, 0.13),
+            c("ping", "Ping", Kind::Mouse(2), Side::Right, 0.65, 0.22, 0.09),
         ],
     }
 }
@@ -556,6 +572,21 @@ fn apply_saved(controls: &mut Vec<Control>, saved: Vec<SavedControl>) {
     }
 }
 
+/// Tata letak Deadlock yang disimpan dengan revisi bawaan lama: tombol bawaan pindah ke posisi dan ukuran bawaan baru
+/// (aksi yang diubah pemain dan pilihan sembunyikan tetap); tombol buatan pemain tidak disentuh.
+fn refresh_old_deadlock(saved: Vec<SavedControl>) -> Vec<SavedControl> {
+    let defaults = default_controls(Profile::Deadlock);
+    saved
+        .into_iter()
+        .map(|mut s| {
+            if let Some(d) = defaults.iter().find(|d| d.id == s.id) {
+                (s.side, s.x, s.y, s.size) = (d.side, d.x, d.y, d.size);
+            }
+            s
+        })
+        .collect()
+}
+
 fn to_saved(profile: Profile, controls: &[Control]) -> Vec<SavedControl> {
     let defaults = default_controls(profile);
     controls
@@ -591,7 +622,8 @@ impl Overlay {
         overlay.profile = saved.profile;
         apply_saved(&mut overlay.layouts[Profile::Gamepad.index()], saved.gamepad);
         apply_saved(&mut overlay.layouts[Profile::Minecraft.index()], saved.minecraft);
-        apply_saved(&mut overlay.layouts[Profile::Deadlock.index()], saved.deadlock);
+        let deadlock = if saved.deadlock_layout < DEADLOCK_LAYOUT { refresh_old_deadlock(saved.deadlock) } else { saved.deadlock };
+        apply_saved(&mut overlay.layouts[Profile::Deadlock.index()], deadlock);
         overlay.gyro = saved.gyro;
         overlay.gyro_invert = saved.gyro_invert;
         overlay
@@ -605,6 +637,7 @@ impl Overlay {
             gamepad: to_saved(Profile::Gamepad, &self.layouts[Profile::Gamepad.index()]),
             minecraft: to_saved(Profile::Minecraft, &self.layouts[Profile::Minecraft.index()]),
             deadlock: to_saved(Profile::Deadlock, &self.layouts[Profile::Deadlock.index()]),
+            deadlock_layout: DEADLOCK_LAYOUT,
             gyro: self.gyro,
             gyro_invert: self.gyro_invert,
         };
@@ -948,7 +981,9 @@ impl Overlay {
                     vy /= length;
                 }
                 self.knobs[usize::from(kind == Kind::RightStick)] = (vx, vy);
-                if let Kind::KeyStick { keys, sprint } = kind {
+                if let Kind::KeyStick { keys, sprint, dash } = kind {
+                    // Jarak jari dari pusat, satuan jari-jari stik (bisa lebih dari 1: jari sudah di luar gambar stik).
+                    let reach = length * STICK_TRAVEL;
                     let length = length.min(1.0);
                     let mut wanted = Vec::new();
                     if length >= KEY_STICK_DEAD {
@@ -961,6 +996,10 @@ impl Overlay {
                         }
                         if sprint != 0 && length >= SPRINT_AT && wanted.contains(&keys[0]) {
                             wanted.push(sprint);
+                        }
+                        let dashing = self.stick_keys.contains(&dash);
+                        if dash != 0 && (reach >= STICK_DASH_AT || (dashing && reach >= STICK_DASH_OFF)) {
+                            wanted.push(dash);
                         }
                     }
                     self.set_stick_keys(wanted);
@@ -1109,7 +1148,8 @@ impl Overlay {
 
     /// Daftar untuk digambar, satu kontrol per baris:
     /// `id|label|bentuk|cx|cy|lebar|tinggi|tanda|kx|ky` (piksel). Bentuk: s stik, d d-pad, c bundar, r lonjong.
-    /// Tanda (bit): 1 terlihat, 2 ditekan (atau hidup, untuk tombol hidup/mati), 4 terpilih (mode atur). `kx,ky`: geseran
+    /// Tanda (bit): 1 terlihat, 2 ditekan (atau hidup, untuk tombol hidup/mati), 4 terpilih (mode atur), 8 stik dengan
+    /// cincin dash (gambar lingkaran putus-putus berjari-jari `STICK_DASH_AT` x jari-jari stik). `kx,ky`: geseran
     /// kepala stik dari pusat; untuk d-pad `kx` berisi bit arah yang ditekan. Kontrol tersembunyi hanya ikut di mode atur.
     /// Kosong bila tidak perlu digambar.
     pub fn describe(&self) -> String {
@@ -1127,7 +1167,8 @@ impl Overlay {
             }
             let (cx, cy, w, h) = self.geometry(c);
             let pressed = self.held_on(index) || self.toggled.contains(&index) || (self.direct && shop);
-            let flags = u8::from(c.visible) | u8::from(pressed) << 1 | u8::from(self.selected == Some(index)) << 2;
+            let dash_ring = matches!(c.kind, Kind::KeyStick { dash, .. } if dash != 0);
+            let flags = u8::from(c.visible) | u8::from(pressed) << 1 | u8::from(self.selected == Some(index)) << 2 | u8::from(dash_ring) << 3;
             let travel = w / 2.0 * STICK_TRAVEL;
             let (kx, ky) = match c.kind {
                 Kind::LeftStick | Kind::KeyStick { .. } => (self.knobs[0].0 * travel, self.knobs[0].1 * travel),
@@ -1659,7 +1700,8 @@ mod tests {
         // "Isi" (R) diganti menjadi G yang hidup/mati dengan tulisan sendiri.
         let at = o.center("reload");
         drag(&mut o, at, at);
-        assert_eq!(o.selected_info(), "reload|Isi|k82|0|0|1");
+        // Bawaan revisi 2: "tahan sambil mengarahkan" (cara kerja 2).
+        assert_eq!(o.selected_info(), "reload|Isi|k82|2|0|1");
         assert!(o.change_selected("Granat", "k71", Mode::Toggle));
         let reload = o.controls().iter().find(|c| c.id == "reload").unwrap().clone();
         assert_eq!((reload.label.as_str(), reload.kind), ("Granat", Kind::KeyToggle(0x47)));
@@ -1742,5 +1784,94 @@ mod tests {
         // Stik tidak berubah jenis walau file menyuruhnya; posisinya tetap diterapkan.
         let stick = controls.iter().find(|c| c.id == "move").unwrap();
         assert!(matches!(stick.kind, Kind::KeyStick { .. }) && stick.label.is_empty() && stick.x == 0.3);
+    }
+
+    #[test]
+    fn deadlock_stick_dashes_once_per_push_past_its_ring() {
+        let view = (2400.0, 1080.0);
+        let mut o = deadlock(view);
+        let (cx, cy) = o.center("move");
+        let radius = 0.34 * view.1 / 2.0;
+        // Jalan ke kanan, masih di dalam stik: D saja.
+        o.touch(t(TouchKind::Down, 1, (cx, cy)));
+        o.touch(t(TouchKind::Move, 1, (cx + radius * 0.9, cy)));
+        assert_eq!(o.take_events(), vec![key(vk::D, true)]);
+        // Lewat cincin: Shift ditekan sekali, D tetap ditahan (arah dash = arah jalan).
+        o.touch(t(TouchKind::Move, 1, (cx + radius * 1.4, cy)));
+        assert_eq!(o.take_events(), vec![key(vk::LSHIFT, true)]);
+        // Jari bertahan di luar atau mundur sedikit (masih di luar stik): tidak ada dash kedua.
+        o.touch(t(TouchKind::Move, 1, (cx + radius * 1.6, cy)));
+        o.touch(t(TouchKind::Move, 1, (cx + radius * 1.1, cy)));
+        assert_eq!(o.take_events(), vec![]);
+        // Kembali ke dalam stik: Shift dilepas, dorongan berikutnya = dash berikutnya, ke arah lain.
+        o.touch(t(TouchKind::Move, 1, (cx + radius * 0.8, cy)));
+        assert_eq!(o.take_events(), vec![key(vk::LSHIFT, false)]);
+        o.touch(t(TouchKind::Move, 1, (cx, cy - radius * 1.4)));
+        assert_eq!(o.take_events(), vec![key(vk::D, false), key(vk::W, true), key(vk::LSHIFT, true)]);
+        o.touch(t(TouchKind::Up, 1, (cx, cy - radius * 1.4)));
+        let mut up = o.take_events();
+        up.sort_by_key(|e| format!("{e:?}"));
+        let mut expected = vec![key(vk::W, false), key(vk::LSHIFT, false)];
+        expected.sort_by_key(|e| format!("{e:?}"));
+        assert_eq!(up, expected);
+        // Cincin hanya digambar untuk stik yang punya dash.
+        let ring = |o: &Overlay| o.describe().lines().find(|l| l.starts_with("move|")).unwrap().split('|').nth(7).unwrap().parse::<u8>().unwrap() & 8 != 0;
+        assert!(ring(&o));
+        assert!(!ring(&minecraft(view)));
+    }
+
+    #[test]
+    fn deadlock_fighting_buttons_turn_the_camera_while_held() {
+        let view = (2400.0, 1080.0);
+        let mut o = deadlock(view);
+        for id in ["jump", "dash", "slide", "melee", "parry", "reload", "skill1", "skill2", "skill3", "skill4", "fire"] {
+            let (cx, cy) = o.center(id);
+            o.touch(t(TouchKind::Down, 7, (cx, cy)));
+            o.touch(t(TouchKind::Move, 7, (cx + 30.0, cy - 12.0)));
+            o.touch(t(TouchKind::Up, 7, (cx + 30.0, cy - 12.0)));
+            let events = o.take_events();
+            assert!(events.contains(&Event::Look { dx: 30, dy: -12 }), "{id}: kamera tidak ikut berputar: {events:?}");
+            // Tombol yang ditekan di PC dilepas lagi saat jempol diangkat.
+            assert!(matches!(events.last(), Some(Event::Key { down: false, .. } | Event::Mouse { down: false, .. })), "{id}: {events:?}");
+        }
+        let melee = o.controls().iter().find(|c| c.id == "melee").unwrap();
+        assert_eq!(melee.kind, Kind::KeyAim(vk::Q));
+        // Pemain bisa mengembalikannya ke tombol biasa lewat "Ubah".
+        o.set_editing(true);
+        let (cx, cy) = o.center("melee");
+        o.touch(t(TouchKind::Down, 1, (cx, cy)));
+        o.touch(t(TouchKind::Up, 1, (cx, cy)));
+        assert!(o.change_selected("Pukul", "k81", Mode::Hold));
+        let loaded = Overlay::from_json(&o.to_json());
+        assert_eq!(loaded.layouts[Profile::Deadlock.index()].iter().find(|c| c.id == "melee").unwrap().kind, Kind::Key(vk::Q));
+    }
+
+    #[test]
+    fn old_deadlock_layouts_move_built_in_buttons_but_keep_the_players_own() {
+        // File dari APK sebelum revisi 2: Dash di kiri, Pukul diubah pemain, Skor disembunyikan, plus tombol E buatannya.
+        let saved = format!(
+            r#"{{"version":{VERSION},"shown":true,"profile":"deadlock","deadlock":[
+                {{"id":"dash","side":"left","x":0.55,"y":0.55,"size":0.14,"visible":true}},
+                {{"id":"melee","side":"right","x":0.662,"y":0.79,"size":0.12,"visible":true,"label":"V","action":"k86","mode":"hold"}},
+                {{"id":"score","side":"left","x":0.25,"y":0.24,"size":0.09,"visible":false}},
+                {{"id":"u1","side":"left","x":0.9,"y":0.5,"size":0.12,"visible":true,"label":"E","action":"k69","mode":"hold"}}
+            ]}}"#
+        );
+        let loaded = Overlay::from_json(&saved);
+        let get = |id: &str| loaded.controls().iter().find(|c| c.id == id).unwrap().clone();
+        let fresh = default_controls(Profile::Deadlock);
+        let new = |id: &str| fresh.iter().find(|c| c.id == id).unwrap().clone();
+        assert_eq!(get("dash"), new("dash"), "posisi dan jenis bawaan baru");
+        let melee = get("melee");
+        assert_eq!((melee.side, melee.x, melee.y, melee.size), (Side::Right, new("melee").x, new("melee").y, new("melee").size));
+        assert_eq!((melee.kind, melee.label.as_str()), (Kind::Key(0x56), "V"), "aksi pilihan pemain tetap");
+        assert!(!get("score").visible, "pilihan sembunyikan tetap");
+        let e = get("u1");
+        assert_eq!((e.kind, e.side, e.x, e.y), (Kind::Key(vk::E), Side::Left, 0.9, 0.5), "tombol buatan tidak disentuh");
+        // Setelah disimpan ulang dengan revisi baru, posisi yang digeser pemain tidak dikembalikan lagi.
+        let mut o = loaded;
+        o.layouts[Profile::Deadlock.index()].iter_mut().find(|c| c.id == "dash").unwrap().x = 0.6;
+        let again = Overlay::from_json(&o.to_json());
+        assert_eq!(again.layouts[Profile::Deadlock.index()].iter().find(|c| c.id == "dash").unwrap().x, 0.6);
     }
 }

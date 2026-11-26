@@ -860,6 +860,12 @@ class StreamActivity : Activity(), SurfaceHolder.Callback, InputManager.InputDev
             strokeWidth = dp(2f).toFloat()
             pathEffect = DashPathEffect(floatArrayOf(dp(6f).toFloat(), dp(4f).toFloat()), 0f)
         }
+        private val ring = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            color = Color.WHITE
+            strokeWidth = dp(1.5f).toFloat()
+            pathEffect = DashPathEffect(floatArrayOf(dp(5f).toFloat(), dp(5f).toFloat()), 0f)
+        }
         private val box = RectF()
 
         override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
@@ -894,6 +900,11 @@ class StreamActivity : Activity(), SurfaceHolder.Callback, InputManager.InputDev
                 box.set(cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2)
                 when (f[2]) {
                     "s" -> {
+                        // Cincin dash (overlay.rs STICK_DASH_AT): jari didorong melewati garis ini = dash.
+                        if (flags and 8 != 0) {
+                            ring.alpha = if (!visible) 40 else 110
+                            canvas.drawCircle(cx, cy, w / 2 * 1.25f, ring)
+                        }
                         canvas.drawCircle(cx, cy, w / 2, fill)
                         canvas.drawCircle(cx, cy, w / 2, stroke)
                         fill.alpha = if (!visible) 30 else if (pressed) 210 else 120
